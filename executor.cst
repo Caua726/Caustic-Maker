@@ -77,6 +77,24 @@ fn mkdir_p(path as *u8) as void {
     syscall(83, path, 493);
 }
 
+// create parent directory of a file path
+fn mkdir_parent(path as *u8) as void {
+    let is i64 as len = strlen(path);
+    let is i64 as last_slash with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (path[i] == 47) {
+            last_slash = i;
+        }
+        i = i + 1;
+    }
+    if (last_slash > 0) {
+        let is *u8 as dir = str_dup(path, cast(i32, last_slash));
+        mkdir_p(dir);
+        mem.gfree(dir);
+    }
+}
+
 // run a command by forking and execve'ing /bin/sh -c "cmd"
 // returns exit code
 fn run_cmd(cmd as *u8) as i32 {
@@ -240,15 +258,22 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
         write_nl(2);
     }
 
-    // 7. link: caustic-ld .caustic/<base>.o -o <out>
+    // 7. ensure output directory exists
+    mkdir_parent(out_path);
+
+    // link to temp first, then rename (avoids overwriting running binary)
+    let is *u8 as tmp_out = str_cat(out_path, ".tmp");
     let is *u8 as link_cmd with mut = str_cat3(ld_bin, " ", cached_o);
-    link_cmd = str_cat3(link_cmd, " -o ", out_path);
+    link_cmd = str_cat3(link_cmd, " -o ", tmp_out);
     rc = run_cmd(link_cmd);
     if (rc != 0) {
         eprint("error: linking failed");
         write_nl(2);
         return rc;
     }
+    // rename tmp -> final (syscall 82)
+    syscall(87, out_path);
+    syscall(82, tmp_out, out_path);
 
     print("  built: ");
     print(out_path);
