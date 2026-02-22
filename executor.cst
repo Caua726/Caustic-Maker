@@ -203,48 +203,13 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     let is *u8 as src = str_dup(t.src_ptr, t.src_len);
     let is *u8 as target_name = str_dup(t.name_ptr, t.name_len);
 
-    // find tools
+    // find caustic (includes assembler+linker via -o)
     let is *u8 as caustic_bin = find_tool("caustic");
-    let is *u8 as as_bin = find_tool("caustic-as");
-    let is *u8 as ld_bin = find_tool("caustic-ld");
 
-    // 1. mkdir .caustic
+    // 1. mkdir .caustic (cache dir)
     mkdir_p(".caustic");
 
-    // 2. compile: caustic <src> [flags]
-    let is *u8 as compile_cmd with mut = str_cat3(caustic_bin, " ", src);
-    if (t.flags_len > 0) {
-        let is *u8 as flags = str_dup(t.flags_ptr, t.flags_len);
-        compile_cmd = str_cat3(compile_cmd, " ", flags);
-    }
-    let is i32 as rc with mut = 0;
-    rc = run_cmd(compile_cmd);
-    if (rc != 0) {
-        eprint("error: compilation failed");
-        write_nl(2);
-        return rc;
-    }
-
-    // 3. the .s file is at <src>.s, move to .caustic/
-    let is *u8 as s_file = str_cat(src, ".s");
-    let is *u8 as base = basename(s_file);
-    let is *u8 as cached_s = str_cat3(".caustic/", base, "");
-    // rename syscall 82
-    syscall(82, s_file, cached_s);
-
-    // 4. assemble: caustic-as .caustic/<base>.s
-    let is *u8 as asm_cmd = str_cat3(as_bin, " ", cached_s);
-    rc = run_cmd(asm_cmd);
-    if (rc != 0) {
-        eprint("error: assembly failed");
-        write_nl(2);
-        return rc;
-    }
-
-    // 5. the .o file is at .caustic/<base>.s.o
-    let is *u8 as cached_o = str_cat(cached_s, ".o");
-
-    // 6. determine output path
+    // 2. determine output path
     let is *u8 as out_path with mut;
     if (t.has_out == 1) {
         out_path = str_dup(t.out_ptr, t.out_len);
@@ -258,20 +223,28 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
         write_nl(2);
     }
 
-    // 7. ensure output directory exists
+    // 3. ensure output directory exists
     mkdir_parent(out_path);
 
-    // link to temp first, then rename (avoids overwriting running binary)
+    // 4. link to temp first, then rename (avoids overwriting running binary)
     let is *u8 as tmp_out = str_cat(out_path, ".tmp");
-    let is *u8 as link_cmd with mut = str_cat3(ld_bin, " ", cached_o);
-    link_cmd = str_cat3(link_cmd, " -o ", tmp_out);
-    rc = run_cmd(link_cmd);
+
+    // 5. compile+assemble+link in one step: caustic <src> -o <tmp_out> --cache .caustic [flags]
+    let is *u8 as cmd with mut = str_cat3(caustic_bin, " ", src);
+    cmd = str_cat3(cmd, " -o ", tmp_out);
+    cmd = str_cat(cmd, " --cache .caustic");
+    if (t.flags_len > 0) {
+        let is *u8 as flags = str_dup(t.flags_ptr, t.flags_len);
+        cmd = str_cat3(cmd, " ", flags);
+    }
+    let is i32 as rc = run_cmd(cmd);
     if (rc != 0) {
-        eprint("error: linking failed");
+        eprint("error: build failed");
         write_nl(2);
         return rc;
     }
-    // rename tmp -> final (syscall 82)
+
+    // 6. rename tmp -> final
     syscall(87, out_path);
     syscall(82, tmp_out, out_path);
 
