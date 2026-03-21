@@ -199,6 +199,181 @@ fn basename(path as *u8) as *u8 {
     return path;
 }
 
+// ── Dependency resolution ──────────────────────────────────────
+
+fn dir_exists(path as *u8) as i32 {
+    let is [144]u8 as st;
+    let is i64 as r = linux.stat(path, &st);
+    if (r == 0) { return 1; }
+    return 0;
+}
+
+fn file_exists(path as *u8) as i32 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd >= 0) {
+        linux.close(fd);
+        return 1;
+    }
+    return 0;
+}
+
+fn read_small_file(path as *u8, out_len as *i64) as *u8 {
+    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    if (fd < 0) { *out_len = 0; return cast(*u8, 0); }
+    let is *u8 as buf = mem.galloc(512);
+    let is i64 as n with mut = linux.read(fd, buf, 511);
+    linux.close(fd);
+    if (n < 0) { n = 0; }
+    buf[n] = 0;
+    *out_len = n;
+    return buf;
+}
+
+fn write_small_file(path as *u8, data as *u8, data_len as i32) as void {
+    let is i64 as fd = linux.open(path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 420);
+    if (fd < 0) { return; }
+    linux.write(fd, data, cast(i64, data_len));
+    linux.close(fd);
+}
+
+fn streq_n(a as *u8, a_len as i64, b as *u8, b_len as i32) as i32 {
+    if (a_len != cast(i64, b_len)) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a_len) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Collect system libs from a dependency's Causticfile
+fn collect_dep_system_libs(dep_dir as *u8) as void {
+    let is *u8 as cf_path = str_cat(dep_dir, "/Causticfile");
+    if (file_exists(cf_path) == 0) { return; }
+    let is i64 as cf_size with mut = 0;
+    let is *u8 as cf_src = read_small_file(cf_path, &cf_size);
+    if (cast(i64, cf_src) == 0 || cf_size == 0) { return; }
+    // mini-parse: look for system "libname" lines
+    let is i64 as pos with mut = 0;
+    while (pos < cf_size) {
+        // skip whitespace
+        while (pos < cf_size && (cf_src[pos] == 32 || cf_src[pos] == 10 || cf_src[pos] == 13 || cf_src[pos] == 9)) {
+            pos = pos + 1;
+        }
+        if (pos >= cf_size) { return; }
+        // check if "system"
+        if (pos + 6 < cf_size && cf_src[pos] == 115 && cf_src[pos + 1] == 121 && cf_src[pos + 2] == 115 && cf_src[pos + 3] == 116 && cf_src[pos + 4] == 101 && cf_src[pos + 5] == 109) {
+            pos = pos + 6;
+            // skip whitespace
+            while (pos < cf_size && (cf_src[pos] == 32 || cf_src[pos] == 9)) { pos = pos + 1; }
+            // expect "
+            if (pos < cf_size && cf_src[pos] == 34) {
+                pos = pos + 1;
+                let is i64 as start = pos;
+                while (pos < cf_size && cf_src[pos] != 34) { pos = pos + 1; }
+                let is i32 as lib_len = cast(i32, pos - start);
+                if (parser.system_lib_count < 16) {
+                    let is *u8 as lib_copy = str_dup(cast(*u8, cast(i64, cf_src) + start), lib_len);
+                    parser.system_lib_ptrs[parser.system_lib_count] = cast(i64, lib_copy);
+                    parser.system_lib_lens[parser.system_lib_count] = lib_len;
+                    parser.system_lib_count = parser.system_lib_count + 1;
+                }
+                if (pos < cf_size) { pos = pos + 1; }
+            }
+        } else {
+            // skip to next line
+            while (pos < cf_size && cf_src[pos] != 10) { pos = pos + 1; }
+            if (pos < cf_size) { pos = pos + 1; }
+        }
+    }
+}
+
+fn check_git() as i32 {
+    // Check if git is available (try "git --version")
+    let is i32 as rc = run_cmd("git --version > /dev/null 2>&1");
+    if (rc != 0) {
+        eprint("error: git is required for dependencies");
+        write_nl(2);
+        return 1;
+    }
+    return 0;
+}
+
+fn resolve_deps(t as *parser.Target) as i32 {
+    let is *parser.Dep as dep with mut = cast(*parser.Dep, t.deps);
+    if (cast(i64, dep) == 0) { return 0; }
+
+    // Check git availability before trying to clone
+    let is i32 as need_clone with mut = 0;
+    let is *parser.Dep as check with mut = dep;
+    while (cast(i64, check) != 0) {
+        let is *u8 as check_name = str_dup(check.name_ptr, check.name_len);
+        let is *u8 as check_dir = str_cat(".caustic/deps/", check_name);
+        if (dir_exists(check_dir) == 0) { need_clone = 1; }
+        check = cast(*parser.Dep, check.next);
+    }
+    if (need_clone == 1) {
+        if (check_git() != 0) { return 1; }
+    }
+
+    while (cast(i64, dep) != 0) {
+        let is *u8 as dep_name = str_dup(dep.name_ptr, dep.name_len);
+        let is *u8 as dep_dir = str_cat(".caustic/deps/", dep_name);
+
+        // Check tag pinning — if tag changed, re-clone
+        if (dep.tag_len > 0 && dir_exists(dep_dir) == 1) {
+            let is *u8 as tag_file = str_cat(dep_dir, "/.caustic-tag");
+            if (file_exists(tag_file) == 1) {
+                let is i64 as stored_len with mut = 0;
+                let is *u8 as stored_tag = read_small_file(tag_file, &stored_len);
+                if (streq_n(stored_tag, stored_len, dep.tag_ptr, dep.tag_len) == 0) {
+                    // tag changed — remove and re-clone
+                    let is *u8 as rm_cmd = str_cat("rm -rf ", dep_dir);
+                    run_cmd(rm_cmd);
+                }
+            }
+        }
+
+        if (dir_exists(dep_dir) == 0) {
+            // Clone
+            mkdir_p(".caustic");
+            mkdir_p(".caustic/deps");
+            let is *u8 as cmd with mut = str_cat("git clone --depth 1 ", "");
+            if (dep.tag_len > 0) {
+                let is *u8 as tag_str = str_dup(dep.tag_ptr, dep.tag_len);
+                cmd = str_cat3(cmd, "--branch ", tag_str);
+                cmd = str_cat(cmd, " ");
+            }
+            let is *u8 as url_str = str_dup(dep.url_ptr, dep.url_len);
+            cmd = str_cat3(cmd, url_str, " ");
+            cmd = str_cat(cmd, dep_dir);
+
+            let is i32 as rc = run_cmd(cmd);
+            if (rc != 0) {
+                eprint("error: failed to clone dependency '");
+                linux.write(2, dep.name_ptr, cast(i64, dep.name_len));
+                eprint("'");
+                write_nl(2);
+                return 1;
+            }
+
+            // Write tag file
+            if (dep.tag_len > 0) {
+                let is *u8 as tag_file = str_cat(dep_dir, "/.caustic-tag");
+                write_small_file(tag_file, dep.tag_ptr, dep.tag_len);
+            }
+        }
+
+        // Collect system libs from dependency
+        collect_dep_system_libs(dep_dir);
+
+        dep = cast(*parser.Dep, dep.next);
+    }
+    return 0;
+}
+
+// ── Build pipeline ────────────────────────────────────────────
+
 fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     let is *u8 as src = str_dup(t.src_ptr, t.src_len);
     let is *u8 as target_name = str_dup(t.name_ptr, t.name_len);
@@ -229,13 +404,28 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     // 4. link to temp first, then rename (avoids overwriting running binary)
     let is *u8 as tmp_out = str_cat(out_path, ".tmp");
 
-    // 5. compile+assemble+link in one step: caustic <src> -o <tmp_out> --cache .caustic [flags]
+    // 5. compile+assemble+link in one step: caustic <src> -o <tmp_out> --cache .caustic [flags] [--path ...] [-l...]
     let is *u8 as cmd with mut = str_cat3(caustic_bin, " ", src);
     cmd = str_cat3(cmd, " -o ", tmp_out);
     cmd = str_cat(cmd, " --cache .caustic");
     if (t.flags_len > 0) {
         let is *u8 as flags = str_dup(t.flags_ptr, t.flags_len);
         cmd = str_cat3(cmd, " ", flags);
+    }
+    // append --path for each dependency
+    let is *parser.Dep as pd with mut = cast(*parser.Dep, t.deps);
+    while (cast(i64, pd) != 0) {
+        let is *u8 as pd_name = str_dup(pd.name_ptr, pd.name_len);
+        let is *u8 as pd_dir = str_cat(".caustic/deps/", pd_name);
+        cmd = str_cat3(cmd, " --path ", pd_dir);
+        pd = cast(*parser.Dep, pd.next);
+    }
+    // append -l for each system lib
+    let is i32 as sli with mut = 0;
+    while (sli < parser.system_lib_count) {
+        let is *u8 as lib_name = str_dup(cast(*u8, parser.system_lib_ptrs[sli]), parser.system_lib_lens[sli]);
+        cmd = str_cat3(cmd, " -l", lib_name);
+        sli = sli + 1;
     }
     let is i32 as rc = run_cmd(cmd);
     if (rc != 0) {
@@ -264,7 +454,7 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32)
         return 1;
     }
 
-    // resolve depends
+    // resolve target depends (another target)
     if (t.depends_len > 0) {
         let is *u8 as dep_name = str_dup(t.depends_ptr, t.depends_len);
         let is i32 as rc = exec_build(proj, dep_name, continue_flag);
@@ -272,6 +462,10 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32)
             return rc;
         }
     }
+
+    // resolve external dependencies (git clone + system libs)
+    let is i32 as dep_rc = resolve_deps(t);
+    if (dep_rc != 0) { return dep_rc; }
 
     print("building target: ");
     print(target_name);

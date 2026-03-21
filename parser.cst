@@ -32,13 +32,17 @@ struct Target {
     depends_ptr as *u8;
     depends_len as i32;
     has_out as i32;
+    deps as *u8;
 }
 
 struct Dep {
     name_ptr as *u8;
     name_len as i32;
-    path_ptr as *u8;
-    path_len as i32;
+    url_ptr as *u8;
+    url_len as i32;
+    tag_ptr as *u8;
+    tag_len as i32;
+    next as *u8;
 }
 
 struct ScriptCmd {
@@ -69,6 +73,11 @@ struct Project {
     scripts as *u8;
     script_count as i32;
 }
+
+// System libraries (top-level)
+let is [16]i64 as system_lib_ptrs with mut;
+let is [16]i32 as system_lib_lens with mut;
+let is i32 as system_lib_count with mut = 0;
 
 // Lexer state
 let is *u8 as _src with mut;
@@ -248,6 +257,7 @@ fn parse_target(proj as *Project) as void {
     t.depends_ptr = cast(*u8, 0);
     t.depends_len = 0;
     t.has_out = 0;
+    t.deps = cast(*u8, 0);
     proj.target_count = idx + 1;
 
     let is Token as tok with mut;
@@ -270,35 +280,40 @@ fn parse_target(proj as *Project) as void {
             let is Token as val = expect_string("depends");
             t.depends_ptr = val.ptr;
             t.depends_len = val.len;
-        }
-        tok = next_token();
-    }
-}
-
-fn parse_dep(proj as *Project) as void {
-    let is Token as name_tok = expect_string("dep name");
-    expect_lbrace();
-
-    let is i32 as idx = proj.dep_count;
-    if (idx >= MAX_DEPS) {
-        eprint("error: too many deps");
-        write_nl(2);
-        linux.exit(1);
-    }
-    let is *Dep as d = get_dep(proj, idx);
-    d.name_ptr = name_tok.ptr;
-    d.name_len = name_tok.len;
-    d.path_ptr = cast(*u8, 0);
-    d.path_len = 0;
-    proj.dep_count = idx + 1;
-
-    let is Token as tok with mut;
-    tok = next_token();
-    while (tok.kind != TK_RBRACE && tok.kind != TK_EOF) {
-        if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "path") == 1) {
-            let is Token as val = expect_string("path");
-            d.path_ptr = val.ptr;
-            d.path_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depend") == 1) {
+            // depend "name" in "url" [tag "version"]
+            let is *Dep as dep = cast(*Dep, mem.galloc(sizeof(Dep)));
+            let is Token as dep_name = expect_string("depend name");
+            dep.name_ptr = dep_name.ptr;
+            dep.name_len = dep_name.len;
+            dep.url_ptr = cast(*u8, 0);
+            dep.url_len = 0;
+            dep.tag_ptr = cast(*u8, 0);
+            dep.tag_len = 0;
+            dep.next = cast(*u8, 0);
+            // expect "in"
+            let is Token as in_tok = next_token();
+            if (in_tok.kind == TK_IDENT && streq(in_tok.ptr, in_tok.len, "in") == 1) {
+                let is Token as url_tok = expect_string("depend url");
+                dep.url_ptr = url_tok.ptr;
+                dep.url_len = url_tok.len;
+            }
+            // optional: tag "version"
+            let is Token as peek = next_token();
+            if (peek.kind == TK_IDENT && streq(peek.ptr, peek.len, "tag") == 1) {
+                let is Token as tag_tok = expect_string("depend tag");
+                dep.tag_ptr = tag_tok.ptr;
+                dep.tag_len = tag_tok.len;
+            } else {
+                // push back - adjust _pos
+                _pos = _pos - cast(i64, peek.len);
+                // account for whitespace before the token
+                // simpler: just re-scan by setting _pos back to token start
+                _pos = cast(i64, peek.ptr) - cast(i64, _src);
+            }
+            // prepend to target's dep list
+            dep.next = t.deps;
+            t.deps = cast(*u8, dep);
         }
         tok = next_token();
     }
@@ -340,6 +355,7 @@ fn parse(src as *u8, src_len as i64) as Project {
     _src = src;
     _src_len = src_len;
     _pos = 0;
+    system_lib_count = 0;
 
     let is Project as proj;
     proj.name_ptr = cast(*u8, 0);
@@ -378,8 +394,13 @@ fn parse(src as *u8, src_len as i64) as Project {
             proj.license_len = val.len;
         } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "target") == 1) {
             parse_target(&proj);
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "dep") == 1) {
-            parse_dep(&proj);
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "system") == 1) {
+            let is Token as val = expect_string("system lib");
+            if (system_lib_count < 16) {
+                system_lib_ptrs[system_lib_count] = cast(i64, val.ptr);
+                system_lib_lens[system_lib_count] = val.len;
+                system_lib_count = system_lib_count + 1;
+            }
         } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "script") == 1) {
             parse_script(&proj);
         } else {
