@@ -305,11 +305,10 @@ fn parse_target(proj as *Project) as void {
                 dep.tag_ptr = tag_tok.ptr;
                 dep.tag_len = tag_tok.len;
             } else {
-                // push back - adjust _pos
-                _pos = _pos - cast(i64, peek.len);
-                // account for whitespace before the token
-                // simpler: just re-scan by setting _pos back to token start
-                _pos = cast(i64, peek.ptr) - cast(i64, _src);
+                // push back - set _pos back to token start
+                if (cast(i64, peek.ptr) != 0) {
+                    _pos = cast(i64, peek.ptr) - cast(i64, _src);
+                }
             }
             // prepend to target's dep list
             dep.next = t.deps;

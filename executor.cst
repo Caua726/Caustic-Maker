@@ -88,7 +88,7 @@ fn mkdir_parent(path as *u8) as void {
         }
         i = i + 1;
     }
-    if (last_slash > 0) {
+    if (last_slash >= 0) {
         let is *u8 as dir = str_dup(path, cast(i32, last_slash));
         mkdir_p(dir);
         mem.gfree(dir);
@@ -109,16 +109,19 @@ fn run_cmd(cmd as *u8) as i32 {
     argv[2] = cast(i64, cmd);
     argv[3] = 0;
 
-    // build envp: inherit (NULL-terminated, we pass minimal)
-    let is [1]i64 as envp;
-    envp[0] = 0;
-
     // fork = syscall 57
     let is i64 as pid = syscall(57);
 
     if (pid == 0) {
-        // child: execve
-        syscall(59, "/bin/sh", &argv, &envp);
+        // child: execve (inherit parent environ via /proc/self/environ is complex;
+        // use environ from _start: argv_base + argc + 1)
+        let is [1]i64 as envp;
+        envp[0] = 0;
+        // Try PATH=/usr/local/bin:/usr/bin:/bin as minimal env
+        let is [2]i64 as env2;
+        env2[0] = cast(i64, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        env2[1] = 0;
+        syscall(59, "/bin/sh", &argv, &env2);
         // if execve fails
         linux.exit(127);
     }
@@ -334,6 +337,10 @@ fn resolve_deps(t as *parser.Target) as i32 {
             }
         }
 
+        if (dep.url_len == 0) {
+            eprint("error: dependency has no url (missing 'in' clause)\n");
+            return 1;
+        }
         if (dir_exists(dep_dir) == 0) {
             // Clone
             mkdir_p(".caustic");
@@ -551,8 +558,14 @@ fn remove_dir(path as *u8) as void {
                 // skip ..
             } else {
                 let is *u8 as full = str_cat3(path, "/", d_name);
-                // unlink = syscall 87
-                syscall(87, full);
+                let is u8 as d_type = entry[18];
+                if (d_type == 4) {
+                    // DT_DIR: recurse
+                    remove_dir(full);
+                } else {
+                    // unlink = syscall 87
+                    syscall(87, full);
+                }
             }
             pos = pos + cast(i64, reclen);
         }
