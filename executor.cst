@@ -381,9 +381,44 @@ fn resolve_deps(t as *parser.Target) as i32 {
 
 // ── Build pipeline ────────────────────────────────────────────
 
+fn _generate_version(proj as *parser.Project, src as *u8) as void {
+    if (proj.version_len == 0) { return; }
+    // Find src directory: "src/main.cst" → "src/"
+    let is i64 as slen = strlen(src);
+    let is i64 as si with mut = slen - 1;
+    while (si >= 0 && src[si] != 47) { si = si - 1; }
+    if (si < 0) { return; }
+    // Build path: dir + "/version.cst"
+    let is [512]u8 as path;
+    let is i64 as pi with mut = 0;
+    while (pi <= si) { path[pi] = src[pi]; pi = pi + 1; }
+    let is *u8 as suffix = "version.cst";
+    let is i64 as sui with mut = 0;
+    while (suffix[sui] != 0) { path[pi] = suffix[sui]; pi = pi + 1; sui = sui + 1; }
+    path[pi] = 0;
+    // Build content: let is *u8 as VERSION with imut = "X.Y.Z";\n
+    let is [256]u8 as content;
+    let is *u8 as pre = "let is *u8 as VERSION with imut = \"";
+    let is i64 as ci with mut = 0;
+    let is i64 as ki with mut = 0;
+    while (pre[ki] != 0) { content[ci] = pre[ki]; ci = ci + 1; ki = ki + 1; }
+    ki = 0;
+    while (ki < cast(i64, proj.version_len)) {
+        content[ci] = proj.version_ptr[ki]; ci = ci + 1; ki = ki + 1;
+    }
+    let is *u8 as post = "\";\n";
+    ki = 0;
+    while (post[ki] != 0) { content[ci] = post[ki]; ci = ci + 1; ki = ki + 1; }
+    content[ci] = 0;
+    write_small_file(cast(*u8, &path), cast(*u8, &content), cast(i32, ci));
+}
+
 fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     let is *u8 as src = str_dup(t.src_ptr, t.src_len);
     let is *u8 as target_name = str_dup(t.name_ptr, t.name_len);
+
+    // Generate version.cst from Causticfile version
+    _generate_version(proj, src);
 
     // find caustic (includes assembler+linker via -o)
     let is *u8 as caustic_bin = find_tool("caustic");
