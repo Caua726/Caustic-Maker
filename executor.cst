@@ -1,6 +1,21 @@
-use "../std/linux.cst" as linux;
+use "../std/io.cst" as io;
 use "../std/mem.cst" as mem;
+use "../std/os.cst" as os;
+use "../std/process.cst" as proc;
 use "parser.cst" as parser;
+
+let is mem.bins.Bins as _bins with mut;
+let is i32 as _bins_ready with mut = 0;
+
+fn galloc_(size as i64) as *u8 {
+    if (_bins_ready == 0) { _bins = mem.bins.bins_new(1048576); _bins_ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn gfree_(ptr as *u8) as void {
+    if (_bins_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
 
 fn strlen(s as *u8) as i64 {
     let is i64 as i with mut = 0;
@@ -11,23 +26,23 @@ fn strlen(s as *u8) as i64 {
 }
 
 fn print(s as *u8) as void {
-    linux.write(1, s, strlen(s));
+    io._write_fd(1, s, strlen(s));
 }
 
 fn eprint(s as *u8) as void {
-    linux.write(2, s, strlen(s));
+    io._write_fd(2, s, strlen(s));
 }
 
 fn write_nl(fd as i64) as void {
     let is [1]u8 as b;
     b[0] = 10;
-    linux.write(fd, &b, 1);
+    io._write_fd(fd, &b, 1);
 }
 
 fn write_quote(fd as i64) as void {
     let is [1]u8 as b;
     b[0] = 34;
-    linux.write(fd, &b, 1);
+    io._write_fd(fd, &b, 1);
 }
 
 fn streq_lit(a as *u8, b as *u8) as i32 {
@@ -42,7 +57,7 @@ fn streq_lit(a as *u8, b as *u8) as i32 {
 
 // copy n bytes from src into a new null-terminated string
 fn str_dup(src as *u8, n as i32) as *u8 {
-    let is *u8 as buf = mem.galloc(cast(i64, n) + 1);
+    let is *u8 as buf = galloc_(cast(i64, n) + 1);
     mem.memcpy(buf, src, cast(i64, n));
     buf[n] = 0;
     return buf;
@@ -52,7 +67,7 @@ fn str_dup(src as *u8, n as i32) as *u8 {
 fn str_cat(a as *u8, b as *u8) as *u8 {
     let is i64 as a_len = strlen(a);
     let is i64 as b_len = strlen(b);
-    let is *u8 as buf = mem.galloc(a_len + b_len + 1);
+    let is *u8 as buf = galloc_(a_len + b_len + 1);
     mem.memcpy(buf, a, a_len);
     mem.memcpy(cast(*u8, cast(i64, buf) + a_len), b, b_len);
     buf[a_len + b_len] = 0;
@@ -64,7 +79,7 @@ fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
     let is i64 as b_len = strlen(b);
     let is i64 as c_len = strlen(c);
     let is i64 as total = a_len + b_len + c_len;
-    let is *u8 as buf = mem.galloc(total + 1);
+    let is *u8 as buf = galloc_(total + 1);
     mem.memcpy(buf, a, a_len);
     mem.memcpy(cast(*u8, cast(i64, buf) + a_len), b, b_len);
     mem.memcpy(cast(*u8, cast(i64, buf) + a_len + b_len), c, c_len);
@@ -72,9 +87,8 @@ fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
     return buf;
 }
 
-// mkdir via syscall 83 (mode 0755 = 493)
 fn mkdir_p(path as *u8) as void {
-    syscall(83, path, 493);
+    io.mkdir(path);
 }
 
 // create parent directory of a file path
@@ -91,67 +105,52 @@ fn mkdir_parent(path as *u8) as void {
     if (last_slash >= 0) {
         let is *u8 as dir = str_dup(path, cast(i32, last_slash));
         mkdir_p(dir);
-        mem.gfree(dir);
+        gfree_(dir);
     }
 }
 
-// run a command by forking and execve'ing /bin/sh -c "cmd"
-// returns exit code
+// Run a shell command (Linux: /bin/sh -c "cmd"; Windows: cmd.exe /c "cmd")
+// and return its exit code. Uses std/process facade for cross-platform.
 fn run_cmd(cmd as *u8) as i32 {
     print("  > ");
     print(cmd);
     write_nl(1);
 
-    // build argv: ["/bin/sh", "-c", cmd, NULL]
-    let is [4]i64 as argv;
-    argv[0] = cast(i64, "/bin/sh");
-    argv[1] = cast(i64, "-c");
-    argv[2] = cast(i64, cmd);
-    argv[3] = 0;
-
-    // fork = syscall 57
-    let is i64 as pid = syscall(57);
-
-    if (pid == 0) {
-        // child: execve (inherit parent environ via /proc/self/environ is complex;
-        // use environ from _start: argv_base + argc + 1)
-        let is [1]i64 as envp;
-        envp[0] = 0;
-        // Try PATH=/usr/local/bin:/usr/bin:/bin as minimal env
-        let is [2]i64 as env2;
-        env2[0] = cast(i64, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        env2[1] = 0;
-        syscall(59, "/bin/sh", &argv, &env2);
-        // if execve fails
-        linux.exit(127);
+    if (os.current == os.OS_LINUX) {
+        let is [4]i64 as argv;
+        argv[0] = cast(i64, "/bin/sh");
+        argv[1] = cast(i64, "-c");
+        argv[2] = cast(i64, cmd);
+        argv[3] = 0;
+        let is i64 as pid = proc.spawn("/bin/sh", cast(*u8, &argv));
+        if (pid < 0) { eprint("error: spawn failed\n"); return 1; }
+        return proc.wait_pid(pid);
     }
-
-    if (pid < 0) {
-        eprint("error: fork failed");
-        write_nl(2);
-        return 1;
+    if (os.current == os.OS_WINDOWS) {
+        // CreateProcessA accepts a single command-line string. We pass the
+        // whole "cmd.exe /c <cmd>" as the path (lpApplicationName=NULL).
+        let is i64 as cmd_len = strlen(cmd);
+        let is *u8 as full = galloc_(cmd_len + 16);
+        let is *u8 as prefix = "cmd.exe /c ";
+        let is i64 as p_len = strlen(prefix);
+        mem.memcpy(full, prefix, p_len);
+        mem.memcpy(cast(*u8, cast(i64, full) + p_len), cmd, cmd_len);
+        full[p_len + cmd_len] = 0;
+        let is i64 as h = proc.spawn(full, cast(*u8, 0));
+        gfree_(full);
+        if (h == 0 - 1) { eprint("error: spawn failed\n"); return 1; }
+        return proc.wait_pid(h);
     }
-
-    // parent: wait4(pid, &status, 0, NULL)
-    let is i32 as status with mut = 0;
-    syscall(61, pid, &status, 0, cast(*u8, 0));
-
-    // extract exit code: status >> 8 & 0xFF
-    let is i32 as code = (status >> 8) & 255;
-    return code;
+    return 1;
 }
 
 // find a tool in PATH. returns heap-allocated full path or the name itself
 fn find_tool(name as *u8) as *u8 {
-    // first check if it exists in current directory
     let is *u8 as local = str_cat("./", name);
-    // try access syscall 21 (F_OK = 0)
-    let is i64 as r = syscall(21, local, 0);
-    if (r == 0) {
+    if (io.exists(local) == 1) {
         return local;
     }
-    mem.gfree(local);
-    // fallback: just use the name (let PATH resolve it via sh)
+    gfree_(local);
     return name;
 }
 
@@ -161,10 +160,10 @@ fn find_target(proj as *parser.Project, name as *u8) as *parser.Target {
         let is *parser.Target as t = parser.get_target(proj, i);
         let is *u8 as tname = str_dup(t.name_ptr, t.name_len);
         if (streq_lit(tname, name) == 1) {
-            mem.gfree(tname);
+            gfree_(tname);
             return t;
         }
-        mem.gfree(tname);
+        gfree_(tname);
         i = i + 1;
     }
     return cast(*parser.Target, 0);
@@ -176,10 +175,10 @@ fn find_script(proj as *parser.Project, name as *u8) as *parser.Script {
         let is *parser.Script as s = parser.get_script(proj, i);
         let is *u8 as sname = str_dup(s.name_ptr, s.name_len);
         if (streq_lit(sname, name) == 1) {
-            mem.gfree(sname);
+            gfree_(sname);
             return s;
         }
-        mem.gfree(sname);
+        gfree_(sname);
         i = i + 1;
     }
     return cast(*parser.Script, 0);
@@ -205,27 +204,19 @@ fn basename(path as *u8) as *u8 {
 // ── Dependency resolution ──────────────────────────────────────
 
 fn dir_exists(path as *u8) as i32 {
-    let is [144]u8 as st;
-    let is i64 as r = linux.stat(path, &st);
-    if (r == 0) { return 1; }
-    return 0;
+    return io.exists(path);
 }
 
 fn file_exists(path as *u8) as i32 {
-    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
-    if (fd >= 0) {
-        linux.close(fd);
-        return 1;
-    }
-    return 0;
+    return io.exists(path);
 }
 
 fn read_small_file(path as *u8, out_len as *i64) as *u8 {
-    let is i64 as fd = linux.open(path, linux.O_RDONLY, 0);
+    let is i64 as fd = io._open_read(path);
     if (fd < 0) { *out_len = 0; return cast(*u8, 0); }
-    let is *u8 as buf = mem.galloc(512);
-    let is i64 as n with mut = linux.read(fd, buf, 511);
-    linux.close(fd);
+    let is *u8 as buf = galloc_(512);
+    let is i64 as n with mut = io._read_fd(fd, buf, 511);
+    io._close_fd(fd);
     if (n < 0) { n = 0; }
     buf[n] = 0;
     *out_len = n;
@@ -233,10 +224,10 @@ fn read_small_file(path as *u8, out_len as *i64) as *u8 {
 }
 
 fn write_small_file(path as *u8, data as *u8, data_len as i32) as void {
-    let is i64 as fd = linux.open(path, linux.O_WRONLY + linux.O_CREAT + linux.O_TRUNC, 420);
+    let is i64 as fd = io._open_write(path);
     if (fd < 0) { return; }
-    linux.write(fd, data, cast(i64, data_len));
-    linux.close(fd);
+    io._write_fd(fd, data, cast(i64, data_len));
+    io._close_fd(fd);
 }
 
 fn streq_n(a as *u8, a_len as i64, b as *u8, b_len as i32) as i32 {
@@ -358,7 +349,7 @@ fn resolve_deps(t as *parser.Target) as i32 {
             let is i32 as rc = run_cmd(cmd);
             if (rc != 0) {
                 eprint("error: failed to clone dependency '");
-                linux.write(2, dep.name_ptr, cast(i64, dep.name_len));
+                io._write_fd(2, dep.name_ptr, cast(i64, dep.name_len));
                 eprint("'");
                 write_nl(2);
                 return 1;
@@ -434,7 +425,7 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
         mkdir_p("build");
         out_path = str_cat("build/", target_name);
         eprint("warning: no 'out' specified for target '");
-        linux.write(2, t.name_ptr, cast(i64, t.name_len));
+        io._write_fd(2, t.name_ptr, cast(i64, t.name_len));
         eprint("', using ");
         eprint(out_path);
         write_nl(2);
@@ -477,8 +468,8 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     }
 
     // 6. rename tmp -> final
-    syscall(87, out_path);
-    syscall(82, tmp_out, out_path);
+    io.unlink(out_path);
+    io.rename(tmp_out, out_path);
 
     print("  built: ");
     print(out_path);
@@ -561,53 +552,23 @@ fn exec_test(proj as *parser.Project) as i32 {
     return exec_run(proj, "test");
 }
 
-// remove files in a directory, then rmdir
+// Recursively remove a directory. Both OSes delegate to the platform's
+// shell rm: simpler than re-implementing getdents64 + Win FindFirstFileA
+// and the directory layout is fully managed by caustic-mk itself.
 fn remove_dir(path as *u8) as void {
-    // open directory: syscall 2 (O_RDONLY | O_DIRECTORY = 0x10000)
-    let is i64 as fd = syscall(2, path, 65536, 0);
-    if (fd < 0) {
+    if (io.exists(path) == 0) { return; }
+    if (os.current == os.OS_LINUX) {
+        let is *u8 as cmd = str_cat("rm -rf ", path);
+        run_cmd(cmd);
+        gfree_(cmd);
         return;
     }
-    let is [4096]u8 as buf;
-    let is i64 as nread with mut = 1;
-    while (nread > 0) {
-        // getdents64 = syscall 217
-        nread = syscall(217, fd, &buf, 4096);
-        if (nread <= 0) {
-            linux.close(fd);
-            // rmdir = syscall 84
-            syscall(84, path);
-            return;
-        }
-        let is i64 as pos with mut = 0;
-        while (pos < nread) {
-            // struct linux_dirent64: offset 0: d_ino(8), offset 8: d_off(8),
-            // offset 16: d_reclen(2), offset 18: d_type(1), offset 19: d_name
-            let is *u8 as entry = cast(*u8, cast(i64, &buf) + pos);
-            let is i32 as reclen = cast(i32, entry[16]) + cast(i32, entry[17]) * 256;
-            let is *u8 as d_name = cast(*u8, cast(i64, entry) + 19);
-            // skip . and ..
-            if (d_name[0] == 46 && d_name[1] == 0) {
-                // skip .
-            } else if (d_name[0] == 46 && d_name[1] == 46 && d_name[2] == 0) {
-                // skip ..
-            } else {
-                let is *u8 as full = str_cat3(path, "/", d_name);
-                let is u8 as d_type = entry[18];
-                if (d_type == 4) {
-                    // DT_DIR: recurse
-                    remove_dir(full);
-                } else {
-                    // unlink = syscall 87
-                    syscall(87, full);
-                }
-            }
-            pos = pos + cast(i64, reclen);
-        }
+    if (os.current == os.OS_WINDOWS) {
+        let is *u8 as cmd = str_cat("rmdir /s /q ", path);
+        run_cmd(cmd);
+        gfree_(cmd);
+        return;
     }
-    linux.close(fd);
-    // rmdir = syscall 84
-    syscall(84, path);
 }
 
 fn exec_clean() as i32 {
@@ -623,7 +584,7 @@ fn exec_init() as i32 {
     // read from stdin
     let is [256]u8 as name_buf;
     let is i64 as n with mut = 0;
-    n = linux.read(0, &name_buf, 255);
+    n = io._read_fd(0, &name_buf, 255);
     if (n <= 0) {
         eprint("error: could not read name");
         write_nl(2);
@@ -636,43 +597,43 @@ fn exec_init() as i32 {
     name_buf[n] = 0;
 
     // write Causticfile
-    let is i64 as fd = syscall(2, "Causticfile", 577, 420);
+    let is i64 as fd = io._open_write("Causticfile");
     if (fd < 0) {
         eprint("error: could not create Causticfile");
         write_nl(2);
         return 1;
     }
 
-    linux.write(fd, "name ", 5);
+    io._write_fd(fd, "name ", 5);
     write_quote(fd);
-    linux.write(fd, &name_buf, n);
-    write_quote(fd);
-    write_nl(fd);
-    linux.write(fd, "version ", 8);
-    write_quote(fd);
-    linux.write(fd, "0.1.0", 5);
+    io._write_fd(fd, &name_buf, n);
     write_quote(fd);
     write_nl(fd);
-    linux.write(fd, "author ", 7);
+    io._write_fd(fd, "version ", 8);
+    write_quote(fd);
+    io._write_fd(fd, "0.1.0", 5);
+    write_quote(fd);
+    write_nl(fd);
+    io._write_fd(fd, "author ", 7);
     write_quote(fd);
     write_quote(fd);
     write_nl(fd);
     write_nl(fd);
-    linux.write(fd, "target ", 7);
+    io._write_fd(fd, "target ", 7);
     write_quote(fd);
-    linux.write(fd, &name_buf, n);
+    io._write_fd(fd, &name_buf, n);
     write_quote(fd);
-    linux.write(fd, " {", 2);
+    io._write_fd(fd, " {", 2);
     write_nl(fd);
-    linux.write(fd, "    src ", 8);
+    io._write_fd(fd, "    src ", 8);
     write_quote(fd);
-    linux.write(fd, "src/main.cst", 12);
+    io._write_fd(fd, "src/main.cst", 12);
     write_quote(fd);
     write_nl(fd);
-    linux.write(fd, "}", 1);
+    io._write_fd(fd, "}", 1);
     write_nl(fd);
 
-    linux.close(fd);
+    io._close_fd(fd);
     print("created Causticfile");
     write_nl(1);
     return 0;

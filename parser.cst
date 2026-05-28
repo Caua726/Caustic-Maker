@@ -1,5 +1,18 @@
-use "../std/linux.cst" as linux;
+use "../std/io.cst" as io;
 use "../std/mem.cst" as mem;
+
+let is mem.bins.Bins as _bins with mut;
+let is i32 as _bins_ready with mut = 0;
+
+fn galloc_(size as i64) as *u8 {
+    if (_bins_ready == 0) { _bins = mem.bins.bins_new(1048576); _bins_ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn gfree_(ptr as *u8) as void {
+    if (_bins_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
 
 // Token types
 let is i32 as TK_IDENT with imut = 1;
@@ -95,11 +108,11 @@ fn strlen(s as *u8) as i64 {
 fn write_nl(fd as i64) as void {
     let is [1]u8 as b;
     b[0] = 10;
-    linux.write(fd, &b, 1);
+    io._write_fd(fd, &b, 1);
 }
 
 fn eprint(s as *u8) as void {
-    linux.write(2, s, strlen(s));
+    io._write_fd(2, s, strlen(s));
 }
 
 fn streq(a as *u8, a_len as i32, b as *u8) as i32 {
@@ -203,9 +216,9 @@ fn expect_string(msg as *u8) as Token {
     let is Token as tok = next_token();
     if (tok.kind != TK_STRING) {
         eprint("error: expected string for ");
-        linux.write(2, msg, strlen(msg));
+        io._write_fd(2, msg, strlen(msg));
         write_nl(2);
-        linux.exit(1);
+        io.exit(1);
     }
     return tok;
 }
@@ -215,7 +228,7 @@ fn expect_lbrace() as void {
     if (tok.kind != TK_LBRACE) {
         eprint("error: expected '{'");
         write_nl(2);
-        linux.exit(1);
+        io.exit(1);
     }
 }
 
@@ -243,7 +256,7 @@ fn parse_target(proj as *Project) as void {
     if (idx >= MAX_TARGETS) {
         eprint("error: too many targets");
         write_nl(2);
-        linux.exit(1);
+        io.exit(1);
     }
     let is *Target as t = get_target(proj, idx);
     t.name_ptr = name_tok.ptr;
@@ -282,7 +295,7 @@ fn parse_target(proj as *Project) as void {
             t.depends_len = val.len;
         } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depend") == 1) {
             // depend "name" in "url" [tag "version"]
-            let is *Dep as dep = cast(*Dep, mem.galloc(sizeof(Dep)));
+            let is *Dep as dep = cast(*Dep, galloc_(sizeof(Dep)));
             let is Token as dep_name = expect_string("depend name");
             dep.name_ptr = dep_name.ptr;
             dep.name_len = dep_name.len;
@@ -326,12 +339,12 @@ fn parse_script(proj as *Project) as void {
     if (idx >= MAX_SCRIPTS) {
         eprint("error: too many scripts");
         write_nl(2);
-        linux.exit(1);
+        io.exit(1);
     }
     let is *Script as s = get_script(proj, idx);
     s.name_ptr = name_tok.ptr;
     s.name_len = name_tok.len;
-    s.cmds = mem.galloc(cast(i64, MAX_CMDS) * sizeof(ScriptCmd));
+    s.cmds = galloc_(cast(i64, MAX_CMDS) * sizeof(ScriptCmd));
     s.cmd_count = 0;
     proj.script_count = idx + 1;
 
@@ -365,11 +378,11 @@ fn parse(src as *u8, src_len as i64) as Project {
     proj.author_len = 0;
     proj.license_ptr = cast(*u8, 0);
     proj.license_len = 0;
-    proj.targets = mem.galloc(cast(i64, MAX_TARGETS) * sizeof(Target));
+    proj.targets = galloc_(cast(i64, MAX_TARGETS) * sizeof(Target));
     proj.target_count = 0;
-    proj.deps = mem.galloc(cast(i64, MAX_DEPS) * sizeof(Dep));
+    proj.deps = galloc_(cast(i64, MAX_DEPS) * sizeof(Dep));
     proj.dep_count = 0;
-    proj.scripts = mem.galloc(cast(i64, MAX_SCRIPTS) * sizeof(Script));
+    proj.scripts = galloc_(cast(i64, MAX_SCRIPTS) * sizeof(Script));
     proj.script_count = 0;
 
     let is Token as tok with mut;
@@ -405,10 +418,10 @@ fn parse(src as *u8, src_len as i64) as Project {
         } else {
             eprint("error: unexpected token: ");
             if (tok.len > 0 && cast(i64, tok.ptr) != 0) {
-                linux.write(2, tok.ptr, cast(i64, tok.len));
+                io._write_fd(2, tok.ptr, cast(i64, tok.len));
             }
             write_nl(2);
-            linux.exit(1);
+            io.exit(1);
         }
         tok = next_token();
     }
