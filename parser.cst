@@ -50,6 +50,7 @@ struct Target {
     mode_len as i32;
     extension_ptr as *u8;   // CSE --extension= value (cse|exe|com), or null
     extension_len as i32;
+    allow_unsupported as i32; // 1 → pass --allow-unsupported (build despite unsupported ops)
 }
 
 struct Dep {
@@ -279,6 +280,7 @@ fn parse_target(proj as *Project) as void {
     t.mode_len = 0;
     t.extension_ptr = cast(*u8, 0);
     t.extension_len = 0;
+    t.allow_unsupported = 0;
     proj.target_count = idx + 1;
 
     let is Token as tok with mut;
@@ -307,6 +309,10 @@ fn parse_target(proj as *Project) as void {
             let is Token as val = expect_string("extension");
             t.extension_ptr = val.ptr;
             t.extension_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "allow_unsupported") == 1) {
+            // Build even if the program uses ops a target doesn't implement.
+            let is Token as val = expect_string("allow_unsupported");
+            t.allow_unsupported = 1;
         } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depends") == 1) {
             let is Token as val = expect_string("depends");
             t.depends_ptr = val.ptr;

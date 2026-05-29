@@ -481,6 +481,14 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
         let is *u8 as ext_v = str_dup(t.extension_ptr, t.extension_len);
         cmd = str_cat3(cmd, " --extension=", ext_v);
     }
+    if (t.allow_unsupported == 1) {
+        cmd = str_cat(cmd, " --allow-unsupported");
+    }
+    // Embed the project version (Causticfile `version`) into the binary.
+    if (proj.version_len > 0) {
+        let is *u8 as ver_v = str_dup(proj.version_ptr, proj.version_len);
+        cmd = str_cat3(cmd, " --app-version=", ver_v);
+    }
     // append --path for each dependency
     let is *parser.Dep as pd with mut = cast(*parser.Dep, t.deps);
     while (cast(i64, pd) != 0) {
