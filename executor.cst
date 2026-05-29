@@ -87,6 +87,18 @@ fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
     return buf;
 }
 
+fn ends_with(s as *u8, suffix as *u8) as i32 {
+    let is i64 as sl = strlen(s);
+    let is i64 as fl = strlen(suffix);
+    if (fl > sl) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < fl) {
+        if (s[sl - fl + i] != suffix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
 fn mkdir_p(path as *u8) as void {
     io.mkdir(path);
 }
@@ -116,7 +128,7 @@ fn run_cmd(cmd as *u8) as i32 {
     print(cmd);
     write_nl(1);
 
-    if (os.current == os.OS_LINUX) {
+    if (os.current() == os.OS_LINUX) {
         let is [4]i64 as argv;
         argv[0] = cast(i64, "/bin/sh");
         argv[1] = cast(i64, "-c");
@@ -126,7 +138,7 @@ fn run_cmd(cmd as *u8) as i32 {
         if (pid < 0) { eprint("error: spawn failed\n"); return 1; }
         return proc.wait_pid(pid);
     }
-    if (os.current == os.OS_WINDOWS) {
+    if (os.current() == os.OS_WINDOWS) {
         // CreateProcessA accepts a single command-line string. We pass the
         // whole "cmd.exe /c <cmd>" as the path (lpApplicationName=NULL).
         let is i64 as cmd_len = strlen(cmd);
@@ -431,6 +443,20 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
         write_nl(2);
     }
 
+    // 2b. CSE auto-extension: pure→.cse, compat/bundle→.exe (PE polyglot),
+    //     or the explicit `extension` key. Skipped if out_path already has it.
+    if (t.mode_len > 0) {
+        let is *u8 as ext with mut = ".exe";
+        if (t.extension_len > 0) {
+            ext = str_cat(".", str_dup(t.extension_ptr, t.extension_len));
+        } else if (streq_n(t.mode_ptr, cast(i64, t.mode_len), "pure", 4) == 1) {
+            ext = ".cse";
+        }
+        if (ends_with(out_path, ext) == 0) {
+            out_path = str_cat(out_path, ext);
+        }
+    }
+
     // 3. ensure output directory exists
     mkdir_parent(out_path);
 
@@ -444,6 +470,16 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     if (t.flags_len > 0) {
         let is *u8 as flags = str_dup(t.flags_ptr, t.flags_len);
         cmd = str_cat3(cmd, " ", flags);
+    }
+    // CSE output mode / extension (only meaningful with --target=caustic-x86_64,
+    // which is supplied via `flags`). Inert for ELF/PE targets.
+    if (t.mode_len > 0) {
+        let is *u8 as mode_v = str_dup(t.mode_ptr, t.mode_len);
+        cmd = str_cat3(cmd, " --mode=", mode_v);
+    }
+    if (t.extension_len > 0) {
+        let is *u8 as ext_v = str_dup(t.extension_ptr, t.extension_len);
+        cmd = str_cat3(cmd, " --extension=", ext_v);
     }
     // append --path for each dependency
     let is *parser.Dep as pd with mut = cast(*parser.Dep, t.deps);
@@ -557,13 +593,13 @@ fn exec_test(proj as *parser.Project) as i32 {
 // and the directory layout is fully managed by caustic-mk itself.
 fn remove_dir(path as *u8) as void {
     if (io.exists(path) == 0) { return; }
-    if (os.current == os.OS_LINUX) {
+    if (os.current() == os.OS_LINUX) {
         let is *u8 as cmd = str_cat("rm -rf ", path);
         run_cmd(cmd);
         gfree_(cmd);
         return;
     }
-    if (os.current == os.OS_WINDOWS) {
+    if (os.current() == os.OS_WINDOWS) {
         let is *u8 as cmd = str_cat("rmdir /s /q ", path);
         run_cmd(cmd);
         gfree_(cmd);

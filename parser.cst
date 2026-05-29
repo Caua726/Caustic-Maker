@@ -46,6 +46,10 @@ struct Target {
     depends_len as i32;
     has_out as i32;
     deps as *u8;
+    mode_ptr as *u8;        // CSE --mode= value (pure|compat|bundle), or null
+    mode_len as i32;
+    extension_ptr as *u8;   // CSE --extension= value (cse|exe|com), or null
+    extension_len as i32;
 }
 
 struct Dep {
@@ -271,6 +275,10 @@ fn parse_target(proj as *Project) as void {
     t.depends_len = 0;
     t.has_out = 0;
     t.deps = cast(*u8, 0);
+    t.mode_ptr = cast(*u8, 0);
+    t.mode_len = 0;
+    t.extension_ptr = cast(*u8, 0);
+    t.extension_len = 0;
     proj.target_count = idx + 1;
 
     let is Token as tok with mut;
@@ -289,6 +297,16 @@ fn parse_target(proj as *Project) as void {
             let is Token as val = expect_string("flags");
             t.flags_ptr = val.ptr;
             t.flags_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "mode") == 1) {
+            // CSE output mode (only used with --target=caustic-x86_64)
+            let is Token as val = expect_string("mode");
+            t.mode_ptr = val.ptr;
+            t.mode_len = val.len;
+        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "extension") == 1) {
+            // CSE output filename extension hint
+            let is Token as val = expect_string("extension");
+            t.extension_ptr = val.ptr;
+            t.extension_len = val.len;
         } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depends") == 1) {
             let is Token as val = expect_string("depends");
             t.depends_ptr = val.ptr;
