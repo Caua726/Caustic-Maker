@@ -1,5 +1,5 @@
-use "../std/io.cst" as io;
-use "common.cst" as c;
+use "../../std/io.cst" as io;
+use "../core/common.cst" as c;
 
 // Token types
 let is i32 as TK_IDENT with imut = 1;

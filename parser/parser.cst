@@ -1,5 +1,5 @@
-use "../std/io.cst" as io;
-use "common.cst" as c;
+use "../../std/io.cst" as io;
+use "../core/common.cst" as c;
 use "cfile_lexer.cst" as lx;
 
 // Max counts

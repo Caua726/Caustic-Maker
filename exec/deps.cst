@@ -1,7 +1,7 @@
-use "../std/io.cst" as io;
-use "common.cst" as c;
-use "sysutil.cst" as sys;
-use "parser.cst" as parser;
+use "../../std/io.cst" as io;
+use "../core/common.cst" as c;
+use "../core/sysutil.cst" as sys;
+use "../parser/parser.cst" as parser;
 
 // ── Dependency resolution ──────────────────────────────────────
 

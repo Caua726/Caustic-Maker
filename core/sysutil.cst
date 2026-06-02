@@ -1,9 +1,9 @@
-use "../std/io.cst" as io;
-use "../std/mem.cst" as mem;
-use "../std/os.cst" as os;
-use "../std/process.cst" as proc;
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
+use "../../std/os.cst" as os;
+use "../../std/process.cst" as proc;
 use "common.cst" as c;
-use "parser.cst" as parser;
+use "../parser/parser.cst" as parser;
 
 // === Well-known paths ===
 let is *u8 as CACHE_DIR  with imut = ".caustic";

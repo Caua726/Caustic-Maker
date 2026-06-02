@@ -1,5 +1,5 @@
-use "../std/io.cst" as io;
-use "../std/mem.cst" as mem;
+use "../../std/io.cst" as io;
+use "../../std/mem.cst" as mem;
 
 // === Shared heap ===
 // One bins allocator for the whole maker. Previously each of main/parser/

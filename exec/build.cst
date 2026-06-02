@@ -1,8 +1,8 @@
-use "../std/io.cst" as io;
-use "common.cst" as c;
-use "sysutil.cst" as sys;
+use "../../std/io.cst" as io;
+use "../core/common.cst" as c;
+use "../core/sysutil.cst" as sys;
 use "deps.cst" as deps;
-use "parser.cst" as parser;
+use "../parser/parser.cst" as parser;
 
 // ── Build pipeline ────────────────────────────────────────────
 

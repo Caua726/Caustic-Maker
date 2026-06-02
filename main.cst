@@ -1,8 +1,8 @@
 use "../std/io.cst" as io;
-use "common.cst" as c;
-use "parser.cst" as parser;
-use "build.cst" as build;
-use "scripts.cst" as scripts;
+use "core/common.cst" as c;
+use "parser/parser.cst" as parser;
+use "exec/build.cst" as build;
+use "exec/scripts.cst" as scripts;
 
 fn print_usage() as void {
     c.print("usage: caustic-mk <command> [args]\n\n");
