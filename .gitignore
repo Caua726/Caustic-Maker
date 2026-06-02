@@ -1,2 +1,5 @@
-main.cst.s.o
-main.cst.s
+# generated build artifacts
+version.cst
+*.cst.s
+*.cst.s.o
+.caustic/
