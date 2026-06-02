@@ -1,37 +1,12 @@
 use "../std/io.cst" as io;
-use "../std/mem.cst" as mem;
-
-let is mem.bins.Bins as _bins with mut;
-let is i32 as _bins_ready with mut = 0;
-
-fn galloc_(size as i64) as *u8 {
-    if (_bins_ready == 0) { _bins = mem.bins.bins_new(1048576); _bins_ready = 1; }
-    return mem.bins.bins_alloc(&_bins, size);
-}
-
-fn gfree_(ptr as *u8) as void {
-    if (_bins_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
-}
-
-
-// Token types
-let is i32 as TK_IDENT with imut = 1;
-let is i32 as TK_STRING with imut = 2;
-let is i32 as TK_LBRACE with imut = 3;
-let is i32 as TK_RBRACE with imut = 4;
-let is i32 as TK_EOF with imut = 5;
+use "common.cst" as c;
+use "cfile_lexer.cst" as lx;
 
 // Max counts
 let is i32 as MAX_TARGETS with imut = 32;
 let is i32 as MAX_DEPS with imut = 32;
 let is i32 as MAX_SCRIPTS with imut = 16;
 let is i32 as MAX_CMDS with imut = 32;
-
-struct Token {
-    kind as i32;
-    ptr as *u8;
-    len as i32;
-}
 
 struct Target {
     name_ptr as *u8;
@@ -92,150 +67,13 @@ struct Project {
     script_count as i32;
 }
 
-// System libraries (top-level)
+// System libraries (top-level `system "lib"` declarations). Read by deps.cst /
+// build.cst when assembling the compile command's -l flags.
 let is [16]i64 as system_lib_ptrs with mut;
 let is [16]i32 as system_lib_lens with mut;
 let is i32 as system_lib_count with mut = 0;
 
-// Lexer state
-let is *u8 as _src with mut;
-let is i64 as _src_len with mut = 0;
-let is i64 as _pos with mut = 0;
-
-fn strlen(s as *u8) as i64 {
-    let is i64 as i with mut = 0;
-    while (s[i] != 0) {
-        i = i + 1;
-    }
-    return i;
-}
-
-fn write_nl(fd as i64) as void {
-    let is [1]u8 as b;
-    b[0] = 10;
-    io._write_fd(fd, &b, 1);
-}
-
-fn eprint(s as *u8) as void {
-    io._write_fd(2, s, strlen(s));
-}
-
-fn streq(a as *u8, a_len as i32, b as *u8) as i32 {
-    let is i64 as b_len = strlen(b);
-    if (cast(i64, a_len) != b_len) {
-        return 0;
-    }
-    let is i64 as i with mut = 0;
-    while (i < b_len) {
-        if (a[i] != b[i]) {
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 1;
-}
-
-fn skip_whitespace() as void {
-    while (_pos < _src_len) {
-        let is u8 as c = _src[_pos];
-        if (c == 32 || c == 9 || c == 10 || c == 13) {
-            _pos = _pos + 1;
-        } else if (c == 47 && _pos + 1 < _src_len && _src[_pos + 1] == 47) {
-            // skip // comment
-            while (_pos < _src_len && _src[_pos] != 10) {
-                _pos = _pos + 1;
-            }
-        } else {
-            return;
-        }
-    }
-}
-
-fn is_ident_char(c as u8) as i32 {
-    if (c >= 97 && c <= 122) { return 1; }
-    if (c >= 65 && c <= 90) { return 1; }
-    if (c >= 48 && c <= 57) { return 1; }
-    if (c == 95) { return 1; }
-    if (c == 45) { return 1; }
-    return 0;
-}
-
-fn next_token() as Token {
-    let is Token as tok;
-    skip_whitespace();
-    if (_pos >= _src_len) {
-        tok.kind = TK_EOF;
-        tok.ptr = cast(*u8, 0);
-        tok.len = 0;
-        return tok;
-    }
-    let is u8 as c = _src[_pos];
-    if (c == 123) {
-        tok.kind = TK_LBRACE;
-        tok.ptr = cast(*u8, cast(i64, _src) + _pos);
-        tok.len = 1;
-        _pos = _pos + 1;
-        return tok;
-    }
-    if (c == 125) {
-        tok.kind = TK_RBRACE;
-        tok.ptr = cast(*u8, cast(i64, _src) + _pos);
-        tok.len = 1;
-        _pos = _pos + 1;
-        return tok;
-    }
-    if (c == 34) {
-        // string literal
-        _pos = _pos + 1;
-        let is i64 as start = _pos;
-        while (_pos < _src_len && _src[_pos] != 34) {
-            _pos = _pos + 1;
-        }
-        tok.kind = TK_STRING;
-        tok.ptr = cast(*u8, cast(i64, _src) + start);
-        tok.len = cast(i32, _pos - start);
-        if (_pos < _src_len) {
-            _pos = _pos + 1;
-        }
-        return tok;
-    }
-    if (is_ident_char(c) == 1) {
-        let is i64 as start = _pos;
-        while (_pos < _src_len && is_ident_char(_src[_pos]) == 1) {
-            _pos = _pos + 1;
-        }
-        tok.kind = TK_IDENT;
-        tok.ptr = cast(*u8, cast(i64, _src) + start);
-        tok.len = cast(i32, _pos - start);
-        return tok;
-    }
-    // unknown char, skip
-    _pos = _pos + 1;
-    tok.kind = TK_EOF;
-    tok.ptr = cast(*u8, 0);
-    tok.len = 0;
-    return tok;
-}
-
-fn expect_string(msg as *u8) as Token {
-    let is Token as tok = next_token();
-    if (tok.kind != TK_STRING) {
-        eprint("error: expected string for ");
-        io._write_fd(2, msg, strlen(msg));
-        write_nl(2);
-        io.exit(1);
-    }
-    return tok;
-}
-
-fn expect_lbrace() as void {
-    let is Token as tok = next_token();
-    if (tok.kind != TK_LBRACE) {
-        eprint("error: expected '{'");
-        write_nl(2);
-        io.exit(1);
-    }
-}
+// === Accessors (safe struct indexing into the parallel arrays) ===
 
 fn get_target(proj as *Project, idx as i32) as *Target {
     return cast(*Target, cast(i64, proj.targets) + cast(i64, idx) * sizeof(Target));
@@ -253,17 +91,9 @@ fn get_script_cmd(scr as *Script, idx as i32) as *ScriptCmd {
     return cast(*ScriptCmd, cast(i64, scr.cmds) + cast(i64, idx) * sizeof(ScriptCmd));
 }
 
-fn parse_target(proj as *Project) as void {
-    let is Token as name_tok = expect_string("target name");
-    expect_lbrace();
+// === Target parsing ===
 
-    let is i32 as idx = proj.target_count;
-    if (idx >= MAX_TARGETS) {
-        eprint("error: too many targets");
-        write_nl(2);
-        io.exit(1);
-    }
-    let is *Target as t = get_target(proj, idx);
+fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
     t.name_ptr = name_tok.ptr;
     t.name_len = name_tok.len;
     t.src_ptr = cast(*u8, 0);
@@ -281,101 +111,117 @@ fn parse_target(proj as *Project) as void {
     t.extension_ptr = cast(*u8, 0);
     t.extension_len = 0;
     t.allow_unsupported = 0;
+}
+
+// Parse `depend "name" in "url" [tag "version"]` and prepend it to t.deps.
+fn _parse_target_depends(t as *Target) as void {
+    let is *Dep as dep = cast(*Dep, c.galloc(sizeof(Dep)));
+    let is lx.Token as dep_name = lx.expect_string("depend name");
+    dep.name_ptr = dep_name.ptr;
+    dep.name_len = dep_name.len;
+    dep.url_ptr = cast(*u8, 0);
+    dep.url_len = 0;
+    dep.tag_ptr = cast(*u8, 0);
+    dep.tag_len = 0;
+    dep.next = cast(*u8, 0);
+    // expect "in"
+    let is lx.Token as in_tok = lx.next_token();
+    if (in_tok.kind == lx.TK_IDENT && c.streq(in_tok.ptr, in_tok.len, "in") == 1) {
+        let is lx.Token as url_tok = lx.expect_string("depend url");
+        dep.url_ptr = url_tok.ptr;
+        dep.url_len = url_tok.len;
+    }
+    // optional: tag "version"
+    let is lx.Token as peek = lx.next_token();
+    if (peek.kind == lx.TK_IDENT && c.streq(peek.ptr, peek.len, "tag") == 1) {
+        let is lx.Token as tag_tok = lx.expect_string("depend tag");
+        dep.tag_ptr = tag_tok.ptr;
+        dep.tag_len = tag_tok.len;
+    } else {
+        // not a tag clause — push the token back for the outer loop
+        lx.lexer_pushback(&peek);
+    }
+    // prepend to target's dep list
+    dep.next = t.deps;
+    t.deps = cast(*u8, dep);
+}
+
+fn parse_target(proj as *Project) as void {
+    let is lx.Token as name_tok = lx.expect_string("target name");
+    lx.expect_lbrace();
+
+    let is i32 as idx = proj.target_count;
+    if (idx >= MAX_TARGETS) {
+        c.eprint("error: too many targets");
+        c.write_nl(2);
+        io.exit(1);
+    }
+    let is *Target as t = get_target(proj, idx);
+    _init_target_defaults(t, &name_tok);
     proj.target_count = idx + 1;
 
-    let is Token as tok with mut;
-    tok = next_token();
-    while (tok.kind != TK_RBRACE && tok.kind != TK_EOF) {
-        if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "src") == 1) {
-            let is Token as val = expect_string("src");
+    let is lx.Token as tok with mut;
+    tok = lx.next_token();
+    while (tok.kind != lx.TK_RBRACE && tok.kind != lx.TK_EOF) {
+        if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "src") == 1) {
+            let is lx.Token as val = lx.expect_string("src");
             t.src_ptr = val.ptr;
             t.src_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "out") == 1) {
-            let is Token as val = expect_string("out");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "out") == 1) {
+            let is lx.Token as val = lx.expect_string("out");
             t.out_ptr = val.ptr;
             t.out_len = val.len;
             t.has_out = 1;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "flags") == 1) {
-            let is Token as val = expect_string("flags");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "flags") == 1) {
+            let is lx.Token as val = lx.expect_string("flags");
             t.flags_ptr = val.ptr;
             t.flags_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "mode") == 1) {
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "mode") == 1) {
             // CSE output mode (only used with --target=caustic-x86_64)
-            let is Token as val = expect_string("mode");
+            let is lx.Token as val = lx.expect_string("mode");
             t.mode_ptr = val.ptr;
             t.mode_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "extension") == 1) {
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "extension") == 1) {
             // CSE output filename extension hint
-            let is Token as val = expect_string("extension");
+            let is lx.Token as val = lx.expect_string("extension");
             t.extension_ptr = val.ptr;
             t.extension_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "allow_unsupported") == 1) {
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "allow_unsupported") == 1) {
             // Build even if the program uses ops a target doesn't implement.
-            let is Token as val = expect_string("allow_unsupported");
+            let is lx.Token as val = lx.expect_string("allow_unsupported");
             t.allow_unsupported = 1;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depends") == 1) {
-            let is Token as val = expect_string("depends");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "depends") == 1) {
+            let is lx.Token as val = lx.expect_string("depends");
             t.depends_ptr = val.ptr;
             t.depends_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "depend") == 1) {
-            // depend "name" in "url" [tag "version"]
-            let is *Dep as dep = cast(*Dep, galloc_(sizeof(Dep)));
-            let is Token as dep_name = expect_string("depend name");
-            dep.name_ptr = dep_name.ptr;
-            dep.name_len = dep_name.len;
-            dep.url_ptr = cast(*u8, 0);
-            dep.url_len = 0;
-            dep.tag_ptr = cast(*u8, 0);
-            dep.tag_len = 0;
-            dep.next = cast(*u8, 0);
-            // expect "in"
-            let is Token as in_tok = next_token();
-            if (in_tok.kind == TK_IDENT && streq(in_tok.ptr, in_tok.len, "in") == 1) {
-                let is Token as url_tok = expect_string("depend url");
-                dep.url_ptr = url_tok.ptr;
-                dep.url_len = url_tok.len;
-            }
-            // optional: tag "version"
-            let is Token as peek = next_token();
-            if (peek.kind == TK_IDENT && streq(peek.ptr, peek.len, "tag") == 1) {
-                let is Token as tag_tok = expect_string("depend tag");
-                dep.tag_ptr = tag_tok.ptr;
-                dep.tag_len = tag_tok.len;
-            } else {
-                // push back - set _pos back to token start
-                if (cast(i64, peek.ptr) != 0) {
-                    _pos = cast(i64, peek.ptr) - cast(i64, _src);
-                }
-            }
-            // prepend to target's dep list
-            dep.next = t.deps;
-            t.deps = cast(*u8, dep);
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "depend") == 1) {
+            _parse_target_depends(t);
         }
-        tok = next_token();
+        tok = lx.next_token();
     }
 }
 
 fn parse_script(proj as *Project) as void {
-    let is Token as name_tok = expect_string("script name");
-    expect_lbrace();
+    let is lx.Token as name_tok = lx.expect_string("script name");
+    lx.expect_lbrace();
 
     let is i32 as idx = proj.script_count;
     if (idx >= MAX_SCRIPTS) {
-        eprint("error: too many scripts");
-        write_nl(2);
+        c.eprint("error: too many scripts");
+        c.write_nl(2);
         io.exit(1);
     }
     let is *Script as s = get_script(proj, idx);
     s.name_ptr = name_tok.ptr;
     s.name_len = name_tok.len;
-    s.cmds = galloc_(cast(i64, MAX_CMDS) * sizeof(ScriptCmd));
+    s.cmds = c.galloc(cast(i64, MAX_CMDS) * sizeof(ScriptCmd));
     s.cmd_count = 0;
     proj.script_count = idx + 1;
 
-    let is Token as tok with mut;
-    tok = next_token();
-    while (tok.kind != TK_RBRACE && tok.kind != TK_EOF) {
-        if (tok.kind == TK_STRING) {
+    let is lx.Token as tok with mut;
+    tok = lx.next_token();
+    while (tok.kind != lx.TK_RBRACE && tok.kind != lx.TK_EOF) {
+        if (tok.kind == lx.TK_STRING) {
             if (s.cmd_count < MAX_CMDS) {
                 let is *ScriptCmd as cmd = get_script_cmd(s, s.cmd_count);
                 cmd.ptr = tok.ptr;
@@ -383,14 +229,12 @@ fn parse_script(proj as *Project) as void {
                 s.cmd_count = s.cmd_count + 1;
             }
         }
-        tok = next_token();
+        tok = lx.next_token();
     }
 }
 
 fn parse(src as *u8, src_len as i64) as Project {
-    _src = src;
-    _src_len = src_len;
-    _pos = 0;
+    lx.lexer_init(src, src_len);
     system_lib_count = 0;
 
     let is Project as proj;
@@ -402,52 +246,52 @@ fn parse(src as *u8, src_len as i64) as Project {
     proj.author_len = 0;
     proj.license_ptr = cast(*u8, 0);
     proj.license_len = 0;
-    proj.targets = galloc_(cast(i64, MAX_TARGETS) * sizeof(Target));
+    proj.targets = c.galloc(cast(i64, MAX_TARGETS) * sizeof(Target));
     proj.target_count = 0;
-    proj.deps = galloc_(cast(i64, MAX_DEPS) * sizeof(Dep));
+    proj.deps = c.galloc(cast(i64, MAX_DEPS) * sizeof(Dep));
     proj.dep_count = 0;
-    proj.scripts = galloc_(cast(i64, MAX_SCRIPTS) * sizeof(Script));
+    proj.scripts = c.galloc(cast(i64, MAX_SCRIPTS) * sizeof(Script));
     proj.script_count = 0;
 
-    let is Token as tok with mut;
-    tok = next_token();
-    while (tok.kind != TK_EOF) {
-        if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "name") == 1) {
-            let is Token as val = expect_string("name");
+    let is lx.Token as tok with mut;
+    tok = lx.next_token();
+    while (tok.kind != lx.TK_EOF) {
+        if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "name") == 1) {
+            let is lx.Token as val = lx.expect_string("name");
             proj.name_ptr = val.ptr;
             proj.name_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "version") == 1) {
-            let is Token as val = expect_string("version");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "version") == 1) {
+            let is lx.Token as val = lx.expect_string("version");
             proj.version_ptr = val.ptr;
             proj.version_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "author") == 1) {
-            let is Token as val = expect_string("author");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "author") == 1) {
+            let is lx.Token as val = lx.expect_string("author");
             proj.author_ptr = val.ptr;
             proj.author_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "license") == 1) {
-            let is Token as val = expect_string("license");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "license") == 1) {
+            let is lx.Token as val = lx.expect_string("license");
             proj.license_ptr = val.ptr;
             proj.license_len = val.len;
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "target") == 1) {
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "target") == 1) {
             parse_target(&proj);
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "system") == 1) {
-            let is Token as val = expect_string("system lib");
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "system") == 1) {
+            let is lx.Token as val = lx.expect_string("system lib");
             if (system_lib_count < 16) {
                 system_lib_ptrs[system_lib_count] = cast(i64, val.ptr);
                 system_lib_lens[system_lib_count] = val.len;
                 system_lib_count = system_lib_count + 1;
             }
-        } else if (tok.kind == TK_IDENT && streq(tok.ptr, tok.len, "script") == 1) {
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "script") == 1) {
             parse_script(&proj);
         } else {
-            eprint("error: unexpected token: ");
+            c.eprint("error: unexpected token: ");
             if (tok.len > 0 && cast(i64, tok.ptr) != 0) {
                 io._write_fd(2, tok.ptr, cast(i64, tok.len));
             }
-            write_nl(2);
+            c.write_nl(2);
             io.exit(1);
         }
-        tok = next_token();
+        tok = lx.next_token();
     }
 
     return proj;

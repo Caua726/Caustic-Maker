@@ -1,0 +1,137 @@
+use "../std/io.cst" as io;
+use "common.cst" as c;
+
+// Token types
+let is i32 as TK_IDENT with imut = 1;
+let is i32 as TK_STRING with imut = 2;
+let is i32 as TK_LBRACE with imut = 3;
+let is i32 as TK_RBRACE with imut = 4;
+let is i32 as TK_EOF with imut = 5;
+
+struct Token {
+    kind as i32;
+    ptr as *u8;
+    len as i32;
+}
+
+// Lexer state. Kept private to this module; the parser drives it through
+// lexer_init / next_token / lexer_pushback so no cross-module global writes
+// are needed.
+let is *u8 as _src with mut;
+let is i64 as _src_len with mut = 0;
+let is i64 as _pos with mut = 0;
+
+fn lexer_init(src as *u8, src_len as i64) as void {
+    _src = src;
+    _src_len = src_len;
+    _pos = 0;
+}
+
+// Rewind so the next next_token() re-reads `tok` (one-token lookahead undo).
+fn lexer_pushback(tok as *Token) as void {
+    if (cast(i64, tok.ptr) != 0) {
+        _pos = cast(i64, tok.ptr) - cast(i64, _src);
+    }
+}
+
+fn skip_whitespace() as void {
+    while (_pos < _src_len) {
+        let is u8 as ch = _src[_pos];
+        if (ch == 32 || ch == 9 || ch == 10 || ch == 13) {
+            _pos = _pos + 1;
+        } else if (ch == 47 && _pos + 1 < _src_len && _src[_pos + 1] == 47) {
+            // skip // comment
+            while (_pos < _src_len && _src[_pos] != 10) {
+                _pos = _pos + 1;
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+fn is_ident_char(ch as u8) as i32 {
+    if (ch >= 97 && ch <= 122) { return 1; }
+    if (ch >= 65 && ch <= 90) { return 1; }
+    if (ch >= 48 && ch <= 57) { return 1; }
+    if (ch == 95) { return 1; }
+    if (ch == 45) { return 1; }
+    return 0;
+}
+
+fn next_token() as Token {
+    let is Token as tok;
+    skip_whitespace();
+    if (_pos >= _src_len) {
+        tok.kind = TK_EOF;
+        tok.ptr = cast(*u8, 0);
+        tok.len = 0;
+        return tok;
+    }
+    let is u8 as ch = _src[_pos];
+    if (ch == 123) {
+        tok.kind = TK_LBRACE;
+        tok.ptr = cast(*u8, cast(i64, _src) + _pos);
+        tok.len = 1;
+        _pos = _pos + 1;
+        return tok;
+    }
+    if (ch == 125) {
+        tok.kind = TK_RBRACE;
+        tok.ptr = cast(*u8, cast(i64, _src) + _pos);
+        tok.len = 1;
+        _pos = _pos + 1;
+        return tok;
+    }
+    if (ch == 34) {
+        // string literal
+        _pos = _pos + 1;
+        let is i64 as start = _pos;
+        while (_pos < _src_len && _src[_pos] != 34) {
+            _pos = _pos + 1;
+        }
+        tok.kind = TK_STRING;
+        tok.ptr = cast(*u8, cast(i64, _src) + start);
+        tok.len = cast(i32, _pos - start);
+        if (_pos < _src_len) {
+            _pos = _pos + 1;
+        }
+        return tok;
+    }
+    if (is_ident_char(ch) == 1) {
+        let is i64 as start = _pos;
+        while (_pos < _src_len && is_ident_char(_src[_pos]) == 1) {
+            _pos = _pos + 1;
+        }
+        tok.kind = TK_IDENT;
+        tok.ptr = cast(*u8, cast(i64, _src) + start);
+        tok.len = cast(i32, _pos - start);
+        return tok;
+    }
+    // unknown char, skip
+    _pos = _pos + 1;
+    tok.kind = TK_EOF;
+    tok.ptr = cast(*u8, 0);
+    tok.len = 0;
+    return tok;
+}
+
+fn expect_string(msg as *u8) as Token {
+    let is Token as tok = next_token();
+    if (tok.kind != TK_STRING) {
+        c.eprint("error: expected string for ");
+        io._write_fd(2, msg, c.strlen(msg));
+        c.write_nl(2);
+        io.exit(1);
+    }
+    return tok;
+}
+
+fn expect_lbrace() as void {
+    let is Token as tok = next_token();
+    if (tok.kind != TK_LBRACE) {
+        c.eprint("error: expected '{'");
+        c.write_nl(2);
+        io.exit(1);
+    }
+}

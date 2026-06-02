@@ -1,0 +1,158 @@
+use "../std/io.cst" as io;
+use "../std/mem.cst" as mem;
+use "../std/os.cst" as os;
+use "../std/process.cst" as proc;
+use "common.cst" as c;
+use "parser.cst" as parser;
+
+// === Well-known paths ===
+let is *u8 as CACHE_DIR  with imut = ".caustic";
+let is *u8 as DEPS_DIR   with imut = ".caustic/deps";
+let is *u8 as TAG_SUFFIX with imut = "/.caustic-tag";
+
+// === Subprocess ===
+
+// Run a shell command (Linux: /bin/sh -c "cmd"; Windows: cmd.exe /c "cmd")
+// and return its exit code. Uses std/process facade for cross-platform.
+fn run_cmd(cmd as *u8) as i32 {
+    c.print("  > ");
+    c.print(cmd);
+    c.write_nl(1);
+
+    if (os.current() == os.OS_LINUX) {
+        let is [4]i64 as argv;
+        argv[0] = cast(i64, "/bin/sh");
+        argv[1] = cast(i64, "-c");
+        argv[2] = cast(i64, cmd);
+        argv[3] = 0;
+        let is i64 as pid = proc.spawn("/bin/sh", cast(*u8, &argv));
+        if (pid < 0) { c.eprint("error: spawn failed\n"); return 1; }
+        return proc.wait_pid(pid);
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        // CreateProcessA accepts a single command-line string. We pass the
+        // whole "cmd.exe /c <cmd>" as the path (lpApplicationName=NULL).
+        let is i64 as cmd_len = c.strlen(cmd);
+        let is *u8 as full = c.galloc(cmd_len + 16);
+        let is *u8 as prefix = "cmd.exe /c ";
+        let is i64 as p_len = c.strlen(prefix);
+        mem.memcpy(full, prefix, p_len);
+        mem.memcpy(cast(*u8, cast(i64, full) + p_len), cmd, cmd_len);
+        full[p_len + cmd_len] = 0;
+        let is i64 as h = proc.spawn(full, cast(*u8, 0));
+        c.gfree(full);
+        if (h == 0 - 1) { c.eprint("error: spawn failed\n"); return 1; }
+        return proc.wait_pid(h);
+    }
+    return 1;
+}
+
+// === Filesystem ===
+
+fn mkdir_p(path as *u8) as void {
+    io.mkdir(path);
+}
+
+// create parent directory of a file path
+fn mkdir_parent(path as *u8) as void {
+    let is i64 as len = c.strlen(path);
+    let is i64 as last_slash with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (path[i] == 47) {
+            last_slash = i;
+        }
+        i = i + 1;
+    }
+    if (last_slash >= 0) {
+        let is *u8 as dir = c.str_dup(path, cast(i32, last_slash));
+        mkdir_p(dir);
+        c.gfree(dir);
+    }
+}
+
+fn dir_exists(path as *u8) as i32 {
+    return io.exists(path);
+}
+
+fn file_exists(path as *u8) as i32 {
+    return io.exists(path);
+}
+
+// extract basename from a path (after last /)
+fn basename(path as *u8) as *u8 {
+    let is i64 as len = c.strlen(path);
+    let is i64 as last_slash with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (path[i] == 47) {
+            last_slash = i;
+        }
+        i = i + 1;
+    }
+    if (last_slash >= 0) {
+        return cast(*u8, cast(i64, path) + last_slash + 1);
+    }
+    return path;
+}
+
+// Recursively remove a directory. Both OSes delegate to the platform's
+// shell rm: simpler than re-implementing getdents64 + Win FindFirstFileA
+// and the directory layout is fully managed by caustic-mk itself.
+fn remove_dir(path as *u8) as void {
+    if (io.exists(path) == 0) { return; }
+    if (os.current() == os.OS_LINUX) {
+        let is *u8 as cmd = c.str_cat("rm -rf ", path);
+        run_cmd(cmd);
+        c.gfree(cmd);
+        return;
+    }
+    if (os.current() == os.OS_WINDOWS) {
+        let is *u8 as cmd = c.str_cat("rmdir /s /q ", path);
+        run_cmd(cmd);
+        c.gfree(cmd);
+        return;
+    }
+}
+
+// === Tool / project lookups ===
+
+// find a tool in PATH. returns heap-allocated full path or the name itself
+fn find_tool(name as *u8) as *u8 {
+    let is *u8 as local = c.str_cat("./", name);
+    if (io.exists(local) == 1) {
+        return local;
+    }
+    c.gfree(local);
+    return name;
+}
+
+fn find_target(proj as *parser.Project, name as *u8) as *parser.Target {
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+        if (c.streq_lit(tname, name) == 1) {
+            c.gfree(tname);
+            return t;
+        }
+        c.gfree(tname);
+        i = i + 1;
+    }
+    return cast(*parser.Target, 0);
+}
+
+fn find_script(proj as *parser.Project, name as *u8) as *parser.Script {
+    let is i32 as i with mut = 0;
+    while (i < proj.script_count) {
+        let is *parser.Script as s = parser.get_script(proj, i);
+        let is *u8 as sname = c.str_dup(s.name_ptr, s.name_len);
+        if (c.streq_lit(sname, name) == 1) {
+            c.gfree(sname);
+            return s;
+        }
+        c.gfree(sname);
+        i = i + 1;
+    }
+    return cast(*parser.Script, 0);
+}

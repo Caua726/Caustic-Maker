@@ -1,0 +1,188 @@
+use "../std/io.cst" as io;
+use "common.cst" as c;
+use "sysutil.cst" as sys;
+use "deps.cst" as deps;
+use "parser.cst" as parser;
+
+// ── Build pipeline ────────────────────────────────────────────
+
+fn _generate_version(proj as *parser.Project, src as *u8) as void {
+    if (proj.version_len == 0) { return; }
+    // Find src directory: "src/main.cst" → "src/"
+    let is i64 as slen = c.strlen(src);
+    let is i64 as si with mut = slen - 1;
+    while (si >= 0 && src[si] != 47) { si = si - 1; }
+    if (si < 0) { return; }
+    // Build path: dir + "/version.cst"
+    let is [512]u8 as path;
+    let is i64 as pi with mut = 0;
+    while (pi <= si) { path[pi] = src[pi]; pi = pi + 1; }
+    let is *u8 as suffix = "version.cst";
+    let is i64 as sui with mut = 0;
+    while (suffix[sui] != 0) { path[pi] = suffix[sui]; pi = pi + 1; sui = sui + 1; }
+    path[pi] = 0;
+    // Build content: let is *u8 as VERSION with imut = "X.Y.Z";\n
+    let is [256]u8 as content;
+    let is *u8 as pre = "let is *u8 as VERSION with imut = \"";
+    let is i64 as ci with mut = 0;
+    let is i64 as ki with mut = 0;
+    while (pre[ki] != 0) { content[ci] = pre[ki]; ci = ci + 1; ki = ki + 1; }
+    ki = 0;
+    while (ki < cast(i64, proj.version_len)) {
+        content[ci] = proj.version_ptr[ki]; ci = ci + 1; ki = ki + 1;
+    }
+    let is *u8 as post = "\";\n";
+    ki = 0;
+    while (post[ki] != 0) { content[ci] = post[ki]; ci = ci + 1; ki = ki + 1; }
+    content[ci] = 0;
+    c.write_small_file(cast(*u8, &path), cast(*u8, &content), cast(i32, ci));
+}
+
+// Decide the final output path for a target (and create its parent dir):
+//   - explicit `out`, else build/<name> with a warning
+//   - CSE auto-extension: pure→.cse, compat/bundle→.exe, or explicit `extension`
+fn _prepare_output_path(t as *parser.Target, target_name as *u8) as *u8 {
+    let is *u8 as out_path with mut;
+    if (t.has_out == 1) {
+        out_path = c.str_dup(t.out_ptr, t.out_len);
+    } else {
+        sys.mkdir_p("build");
+        out_path = c.str_cat("build/", target_name);
+        c.eprint("warning: no 'out' specified for target '");
+        io._write_fd(2, t.name_ptr, cast(i64, t.name_len));
+        c.eprint("', using ");
+        c.eprint(out_path);
+        c.write_nl(2);
+    }
+
+    // CSE auto-extension: pure→.cse, compat/bundle→.exe (PE polyglot),
+    // or the explicit `extension` key. Skipped if out_path already has it.
+    if (t.mode_len > 0) {
+        let is *u8 as ext with mut = ".exe";
+        if (t.extension_len > 0) {
+            ext = c.str_cat(".", c.str_dup(t.extension_ptr, t.extension_len));
+        } else if (c.streq_n(t.mode_ptr, cast(i64, t.mode_len), "pure", 4) == 1) {
+            ext = ".cse";
+        }
+        if (c.ends_with(out_path, ext) == 0) {
+            out_path = c.str_cat(out_path, ext);
+        }
+    }
+
+    // ensure output directory exists
+    sys.mkdir_parent(out_path);
+    return out_path;
+}
+
+// Assemble the full `caustic <src> -o <tmp_out> ...` invocation: flags, CSE
+// mode/extension, allow-unsupported, app-version, dependency --path, system -l.
+fn _build_compile_cmd(t as *parser.Target, proj as *parser.Project, caustic_bin as *u8, src as *u8, tmp_out as *u8) as *u8 {
+    let is *u8 as cmd with mut = c.str_cat3(caustic_bin, " ", src);
+    cmd = c.str_cat3(cmd, " -o ", tmp_out);
+    cmd = c.str_cat(cmd, " --cache .caustic");
+    if (t.flags_len > 0) {
+        let is *u8 as flags = c.str_dup(t.flags_ptr, t.flags_len);
+        cmd = c.str_cat3(cmd, " ", flags);
+    }
+    // CSE output mode / extension (only meaningful with --target=caustic-x86_64,
+    // which is supplied via `flags`). Inert for ELF/PE targets.
+    if (t.mode_len > 0) {
+        let is *u8 as mode_v = c.str_dup(t.mode_ptr, t.mode_len);
+        cmd = c.str_cat3(cmd, " --mode=", mode_v);
+    }
+    if (t.extension_len > 0) {
+        let is *u8 as ext_v = c.str_dup(t.extension_ptr, t.extension_len);
+        cmd = c.str_cat3(cmd, " --extension=", ext_v);
+    }
+    if (t.allow_unsupported == 1) {
+        cmd = c.str_cat(cmd, " --allow-unsupported");
+    }
+    // Embed the project version (Causticfile `version`) into the binary.
+    if (proj.version_len > 0) {
+        let is *u8 as ver_v = c.str_dup(proj.version_ptr, proj.version_len);
+        cmd = c.str_cat3(cmd, " --app-version=", ver_v);
+    }
+    // append --path for each dependency
+    let is *parser.Dep as pd with mut = cast(*parser.Dep, t.deps);
+    while (cast(i64, pd) != 0) {
+        let is *u8 as pd_name = c.str_dup(pd.name_ptr, pd.name_len);
+        let is *u8 as pd_dir = c.str_cat3(sys.DEPS_DIR, "/", pd_name);
+        cmd = c.str_cat3(cmd, " --path ", pd_dir);
+        pd = cast(*parser.Dep, pd.next);
+    }
+    // append -l for each system lib
+    let is i32 as sli with mut = 0;
+    while (sli < parser.system_lib_count) {
+        let is *u8 as lib_name = c.str_dup(cast(*u8, parser.system_lib_ptrs[sli]), parser.system_lib_lens[sli]);
+        cmd = c.str_cat3(cmd, " -l", lib_name);
+        sli = sli + 1;
+    }
+    return cmd;
+}
+
+// Run the compile command and atomically swap the temp output into place.
+fn _run_compile(cmd as *u8, out_path as *u8, tmp_out as *u8) as i32 {
+    let is i32 as rc = sys.run_cmd(cmd);
+    if (rc != 0) {
+        c.eprint("error: build failed");
+        c.write_nl(2);
+        return rc;
+    }
+    // rename tmp -> final (avoids overwriting a running binary)
+    io.unlink(out_path);
+    io.rename(tmp_out, out_path);
+    c.print("  built: ");
+    c.print(out_path);
+    c.write_nl(1);
+    return 0;
+}
+
+fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
+    let is *u8 as src = c.str_dup(t.src_ptr, t.src_len);
+    let is *u8 as target_name = c.str_dup(t.name_ptr, t.name_len);
+
+    // Generate version.cst from Causticfile version
+    _generate_version(proj, src);
+
+    // find caustic (includes assembler+linker via -o)
+    let is *u8 as caustic_bin = sys.find_tool("caustic");
+
+    // cache dir
+    sys.mkdir_p(sys.CACHE_DIR);
+
+    let is *u8 as out_path = _prepare_output_path(t, target_name);
+    // link to temp first, then rename (avoids overwriting running binary)
+    let is *u8 as tmp_out = c.str_cat(out_path, ".tmp");
+    let is *u8 as cmd = _build_compile_cmd(t, proj, caustic_bin, src, tmp_out);
+    return _run_compile(cmd, out_path, tmp_out);
+}
+
+fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32) as i32 {
+    let is *parser.Target as t = sys.find_target(proj, target_name);
+    if (cast(i64, t) == 0) {
+        c.eprint("error: target '");
+        c.eprint(target_name);
+        c.eprint("' not found");
+        c.write_nl(2);
+        return 1;
+    }
+
+    // resolve target depends (another target)
+    if (t.depends_len > 0) {
+        let is *u8 as dep_name = c.str_dup(t.depends_ptr, t.depends_len);
+        let is i32 as rc = exec_build(proj, dep_name, continue_flag);
+        if (rc != 0 && continue_flag == 0) {
+            return rc;
+        }
+    }
+
+    // resolve external dependencies (git clone + system libs)
+    let is i32 as dep_rc = deps.resolve_deps(t);
+    if (dep_rc != 0) { return dep_rc; }
+
+    c.print("building target: ");
+    c.print(target_name);
+    c.write_nl(1);
+
+    return run_pipeline(t, proj);
+}

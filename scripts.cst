@@ -1,0 +1,119 @@
+use "../std/io.cst" as io;
+use "common.cst" as c;
+use "sysutil.cst" as sys;
+use "parser.cst" as parser;
+
+// ── Script + lifecycle commands ───────────────────────────────
+
+fn run_script(proj as *parser.Project, scr as *parser.Script) as i32 {
+    let is i32 as i with mut = 0;
+    while (i < scr.cmd_count) {
+        let is *parser.ScriptCmd as cmd = parser.get_script_cmd(scr, i);
+        let is *u8 as cmd_str = c.str_dup(cmd.ptr, cmd.len);
+        let is i32 as rc = sys.run_cmd(cmd_str);
+        if (rc != 0) {
+            return rc;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn exec_run(proj as *parser.Project, name as *u8) as i32 {
+    // check scripts first
+    let is *parser.Script as scr = sys.find_script(proj, name);
+    if (cast(i64, scr) != 0) {
+        return run_script(proj, scr);
+    }
+
+    // check targets - run the built binary
+    let is *parser.Target as t = sys.find_target(proj, name);
+    if (cast(i64, t) != 0) {
+        let is *u8 as out_path with mut;
+        if (t.has_out == 1) {
+            out_path = c.str_dup(t.out_ptr, t.out_len);
+        } else {
+            let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+            out_path = c.str_cat("build/", tname);
+        }
+        return sys.run_cmd(out_path);
+    }
+
+    c.eprint("error: '");
+    c.eprint(name);
+    c.eprint("' is not a script or target");
+    c.write_nl(2);
+    return 1;
+}
+
+fn exec_test(proj as *parser.Project) as i32 {
+    return exec_run(proj, "test");
+}
+
+fn exec_clean() as i32 {
+    c.print("cleaning .caustic/ and build/");
+    c.write_nl(1);
+    sys.remove_dir(".caustic");
+    sys.remove_dir("build");
+    return 0;
+}
+
+fn exec_init() as i32 {
+    c.print("project name: ");
+    // read from stdin
+    let is [256]u8 as name_buf;
+    let is i64 as n with mut = 0;
+    n = io._read_fd(0, &name_buf, 255);
+    if (n <= 0) {
+        c.eprint("error: could not read name");
+        c.write_nl(2);
+        return 1;
+    }
+    // strip newline
+    if (n > 0 && name_buf[n - 1] == 10) {
+        n = n - 1;
+    }
+    name_buf[n] = 0;
+
+    // write Causticfile
+    let is i64 as fd = io._open_write("Causticfile");
+    if (fd < 0) {
+        c.eprint("error: could not create Causticfile");
+        c.write_nl(2);
+        return 1;
+    }
+
+    io._write_fd(fd, "name ", 5);
+    c.write_quote(fd);
+    io._write_fd(fd, &name_buf, n);
+    c.write_quote(fd);
+    c.write_nl(fd);
+    io._write_fd(fd, "version ", 8);
+    c.write_quote(fd);
+    io._write_fd(fd, "0.1.0", 5);
+    c.write_quote(fd);
+    c.write_nl(fd);
+    io._write_fd(fd, "author ", 7);
+    c.write_quote(fd);
+    c.write_quote(fd);
+    c.write_nl(fd);
+    c.write_nl(fd);
+    io._write_fd(fd, "target ", 7);
+    c.write_quote(fd);
+    io._write_fd(fd, &name_buf, n);
+    c.write_quote(fd);
+    io._write_fd(fd, " {", 2);
+    c.write_nl(fd);
+    io._write_fd(fd, "    src ", 8);
+    c.write_quote(fd);
+    io._write_fd(fd, "src/main.cst", 12);
+    c.write_quote(fd);
+    c.write_nl(fd);
+    io._write_fd(fd, "}", 1);
+    c.write_nl(fd);
+
+    io._close_fd(fd);
+    c.print("created Causticfile");
+    c.write_nl(1);
+    return 0;
+}

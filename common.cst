@@ -1,0 +1,173 @@
+use "../std/io.cst" as io;
+use "../std/mem.cst" as mem;
+
+// === Shared heap ===
+// One bins allocator for the whole maker. Previously each of main/parser/
+// executor span up its own 1 MiB pool; a single shared pool is simpler and
+// lighter. All alloc/free across the maker route through galloc/gfree.
+let is mem.bins.Bins as _heap with mut;
+let is i32 as _heap_ready with mut = 0;
+
+fn _heap_init() as void {
+    if (_heap_ready == 0) {
+        _heap = mem.bins.bins_new(1048576);
+        _heap_ready = 1;
+    }
+}
+
+fn galloc(size as i64) as *u8 {
+    _heap_init();
+    return mem.bins.bins_alloc(&_heap, size);
+}
+
+fn gfree(ptr as *u8) as void {
+    if (_heap_ready == 1) { mem.bins.bins_free(&_heap, ptr); }
+}
+
+// === String helpers ===
+
+fn strlen(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { i = i + 1; }
+    return i;
+}
+
+fn print(s as *u8) as void {
+    io._write_fd(io.STDOUT, s, strlen(s));
+}
+
+fn eprint(s as *u8) as void {
+    io._write_fd(io.STDERR, s, strlen(s));
+}
+
+fn write_nl(fd as i64) as void {
+    io._write_fd(fd, "\n", 1);
+}
+
+fn write_quote(fd as i64) as void {
+    io._write_fd(fd, "\"", 1);
+}
+
+// Compare a (length-bounded) string against a null-terminated literal.
+fn streq_lit(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != 0) { return 0; }
+    return 1;
+}
+
+// Compare a token (a, a_len) against a null-terminated literal b.
+fn streq(a as *u8, a_len as i32, b as *u8) as i32 {
+    let is i64 as b_len = strlen(b);
+    if (cast(i64, a_len) != b_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < b_len) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Compare two explicit (ptr, len) strings.
+fn streq_n(a as *u8, a_len as i64, b as *u8, b_len as i32) as i32 {
+    if (a_len != cast(i64, b_len)) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a_len) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// copy n bytes from src into a new null-terminated string
+fn str_dup(src as *u8, n as i32) as *u8 {
+    let is *u8 as buf = galloc(cast(i64, n) + 1);
+    mem.memcpy(buf, src, cast(i64, n));
+    buf[n] = 0;
+    return buf;
+}
+
+// concat two null-terminated strings
+fn str_cat(a as *u8, b as *u8) as *u8 {
+    let is i64 as a_len = strlen(a);
+    let is i64 as b_len = strlen(b);
+    let is *u8 as buf = galloc(a_len + b_len + 1);
+    mem.memcpy(buf, a, a_len);
+    mem.memcpy(cast(*u8, cast(i64, buf) + a_len), b, b_len);
+    buf[a_len + b_len] = 0;
+    return buf;
+}
+
+fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
+    let is i64 as a_len = strlen(a);
+    let is i64 as b_len = strlen(b);
+    let is i64 as c_len = strlen(c);
+    let is i64 as total = a_len + b_len + c_len;
+    let is *u8 as buf = galloc(total + 1);
+    mem.memcpy(buf, a, a_len);
+    mem.memcpy(cast(*u8, cast(i64, buf) + a_len), b, b_len);
+    mem.memcpy(cast(*u8, cast(i64, buf) + a_len + b_len), c, c_len);
+    buf[total] = 0;
+    return buf;
+}
+
+fn ends_with(s as *u8, suffix as *u8) as i32 {
+    let is i64 as sl = strlen(s);
+    let is i64 as fl = strlen(suffix);
+    if (fl > sl) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < fl) {
+        if (s[sl - fl + i] != suffix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// === File helpers ===
+
+fn read_file(path as *u8) as *u8 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return cast(*u8, 0); }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._lseek(fd, 0, io._SEEK_SET);
+    if (size <= 0) {
+        io._close_fd(fd);
+        return cast(*u8, 0);
+    }
+    let is *u8 as buf = galloc(size + 1);
+    io._read_fd(fd, buf, size);
+    buf[size] = 0;
+    io._close_fd(fd);
+    return buf;
+}
+
+fn read_file_size(path as *u8) as i64 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
+    io._close_fd(fd);
+    return size;
+}
+
+// Read a small (<512B) file into a freshly-allocated buffer; sets *out_len.
+fn read_small_file(path as *u8, out_len as *i64) as *u8 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { *out_len = 0; return cast(*u8, 0); }
+    let is *u8 as buf = galloc(512);
+    let is i64 as n with mut = io._read_fd(fd, buf, 511);
+    io._close_fd(fd);
+    if (n < 0) { n = 0; }
+    buf[n] = 0;
+    *out_len = n;
+    return buf;
+}
+
+fn write_small_file(path as *u8, data as *u8, data_len as i32) as void {
+    let is i64 as fd = io._open_write(path);
+    if (fd < 0) { return; }
+    io._write_fd(fd, data, cast(i64, data_len));
+    io._close_fd(fd);
+}

@@ -1,97 +1,17 @@
 use "../std/io.cst" as io;
-use "../std/mem.cst" as mem;
+use "common.cst" as c;
 use "parser.cst" as parser;
-use "executor.cst" as exec;
-
-let is mem.bins.Bins as _heap with mut;
-let is i32 as _heap_ready with mut = 0;
-
-fn _heap_init() as void {
-    if (_heap_ready == 0) {
-        _heap = mem.bins.bins_new(1048576);
-        _heap_ready = 1;
-    }
-}
-
-fn galloc(size as i64) as *u8 {
-    _heap_init();
-    return mem.bins.bins_alloc(&_heap, size);
-}
-
-fn gfree(ptr as *u8) as void {
-    if (_heap_ready == 1) { mem.bins.bins_free(&_heap, ptr); }
-}
-
-fn strlen(s as *u8) as i64 {
-    let is i64 as i with mut = 0;
-    while (s[i] != 0) {
-        i = i + 1;
-    }
-    return i;
-}
-
-fn print(s as *u8) as void {
-    io._write_fd(io.STDOUT, s, strlen(s));
-}
-
-fn eprint(s as *u8) as void {
-    io._write_fd(io.STDERR, s, strlen(s));
-}
-
-fn nl() as void {
-    io._write_fd(io.STDOUT, "\n", 1);
-}
-
-fn streq_lit(a as *u8, b as *u8) as i32 {
-    let is i64 as i with mut = 0;
-    while (b[i] != 0) {
-        if (a[i] != b[i]) { return 0; }
-        i = i + 1;
-    }
-    if (a[i] != 0) { return 0; }
-    return 1;
-}
-
-fn write_nl(fd as i64) as void {
-    io._write_fd(fd, "\n", 1);
-}
+use "build.cst" as build;
+use "scripts.cst" as scripts;
 
 fn print_usage() as void {
-    print("usage: caustic-mk <command> [args]\n\n");
-    print("commands:\n");
-    print("  build <target>  build a target\n");
-    print("  run <name>      run script or target\n");
-    print("  test            run 'test' script\n");
-    print("  clean           remove .caustic/ and build/\n");
-    print("  init            create a new Causticfile\n");
-}
-
-fn read_file(path as *u8) as *u8 {
-    let is i64 as fd = io._open_read(path);
-    if (fd < 0) {
-        return cast(*u8, 0);
-    }
-    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
-    io._lseek(fd, 0, io._SEEK_SET);
-    if (size <= 0) {
-        io._close_fd(fd);
-        return cast(*u8, 0);
-    }
-    let is *u8 as buf = galloc(size + 1);
-    io._read_fd(fd, buf, size);
-    buf[size] = 0;
-    io._close_fd(fd);
-    return buf;
-}
-
-fn read_file_size(path as *u8) as i64 {
-    let is i64 as fd = io._open_read(path);
-    if (fd < 0) {
-        return 0;
-    }
-    let is i64 as size = io._lseek(fd, 0, io._SEEK_END);
-    io._close_fd(fd);
-    return size;
+    c.print("usage: caustic-mk <command> [args]\n\n");
+    c.print("commands:\n");
+    c.print("  build <target>  build a target\n");
+    c.print("  run <name>      run script or target\n");
+    c.print("  test            run 'test' script\n");
+    c.print("  clean           remove .caustic/ and build/\n");
+    c.print("  init            create a new Causticfile\n");
 }
 
 fn main(argc as i64, argv as i64) as i32 {
@@ -105,66 +25,62 @@ fn main(argc as i64, argv as i64) as i32 {
     let is *u8 as cmd = cast(*u8, argv_arr[1]);
 
     // clean and init don't need Causticfile
-    if (streq_lit(cmd, "clean") == 1) {
-        _heap_init();
-        return exec.exec_clean();
+    if (c.streq_lit(cmd, "clean") == 1) {
+        return scripts.exec_clean();
     }
-    if (streq_lit(cmd, "init") == 1) {
-        _heap_init();
-        return exec.exec_init();
+    if (c.streq_lit(cmd, "init") == 1) {
+        return scripts.exec_init();
     }
 
-    if (streq_lit(cmd, "build") == 1 && argc < 3) {
-        eprint("error: no target specified\n");
-        eprint("usage: caustic-mk build <target>\n");
+    if (c.streq_lit(cmd, "build") == 1 && argc < 3) {
+        c.eprint("error: no target specified\n");
+        c.eprint("usage: caustic-mk build <target>\n");
         return 1;
     }
 
-    let is i64 as file_size = read_file_size("Causticfile");
+    let is i64 as file_size = c.read_file_size("Causticfile");
     if (file_size == 0) {
-        eprint("error: Causticfile not found\n");
+        c.eprint("error: Causticfile not found\n");
         return 1;
     }
 
-    _heap_init();
-
-    let is *u8 as src = read_file("Causticfile");
+    let is *u8 as src = c.read_file("Causticfile");
     if (cast(i64, src) == 0) {
-        eprint("error: could not read Causticfile\n");
+        c.eprint("error: could not read Causticfile\n");
         return 1;
     }
 
     let is parser.Project as proj = parser.parse(src, file_size);
 
-    if (streq_lit(cmd, "build") == 1) {
+    if (c.streq_lit(cmd, "build") == 1) {
         let is *u8 as target_name = cast(*u8, argv_arr[2]);
         let is i32 as continue_flag with mut = 0;
         if (argc >= 4) {
             let is *u8 as flag = cast(*u8, argv_arr[3]);
-            if (streq_lit(flag, "--continue") == 1) {
+            if (c.streq_lit(flag, "--continue") == 1) {
                 continue_flag = 1;
             }
         }
-        return exec.exec_build(&proj, target_name, continue_flag);
+        return build.exec_build(&proj, target_name, continue_flag);
     }
 
-    if (streq_lit(cmd, "run") == 1) {
+    if (c.streq_lit(cmd, "run") == 1) {
         if (argc < 3) {
-            eprint("error: no name specified\n");
-            eprint("usage: caustic-mk run <name>\n");
+            c.eprint("error: no name specified\n");
+            c.eprint("usage: caustic-mk run <name>\n");
             return 1;
         }
         let is *u8 as name = cast(*u8, argv_arr[2]);
-        return exec.exec_run(&proj, name);
+        return scripts.exec_run(&proj, name);
     }
 
-    if (streq_lit(cmd, "test") == 1) {
-        return exec.exec_test(&proj);
+    if (c.streq_lit(cmd, "test") == 1) {
+        return scripts.exec_test(&proj);
     }
 
-    eprint("error: unknown command '");
-    io._write_fd(io.STDERR, cmd, strlen(cmd));
-    eprint("'\n");
+    c.eprint("error: unknown command '");
+    io._write_fd(io.STDERR, cmd, c.strlen(cmd));
+    c.eprint("'\n");
     print_usage();
     return 1;
 }
