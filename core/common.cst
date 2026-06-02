@@ -171,3 +171,70 @@ fn write_small_file(path as *u8, data as *u8, data_len as i32) as void {
     io._write_fd(fd, data, cast(i64, data_len));
     io._close_fd(fd);
 }
+
+// djb2 content hash — used to key per-module object cache entries.
+fn djb2(s as *u8, len as i64) as i64 {
+    let is i64 as h with mut = 5381;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        h = ((h << 5) + h) + cast(i64, s[i]);
+        i = i + 1;
+    }
+    return h & cast(i64, 4611686018427387903);   // keep positive
+}
+
+// djb2 over a file's contents, streamed through a stack buffer so large
+// modules (>64 KiB) don't blow the bins allocator's max-bin limit. Returns 0
+// if the file can't be opened. Bit-identical to djb2(read_file(path), size).
+fn hash_file(path as *u8) as i64 {
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0; }
+    let is i64 as h with mut = 5381;
+    let is [8192]u8 as buf;
+    let is i64 as n with mut = io._read_fd(fd, cast(*u8, &buf), 8192);
+    while (n > 0) {
+        let is i64 as i with mut = 0;
+        while (i < n) {
+            h = ((h << 5) + h) + cast(i64, buf[i]);
+            i = i + 1;
+        }
+        n = io._read_fd(fd, cast(*u8, &buf), 8192);
+    }
+    io._close_fd(fd);
+    return h & cast(i64, 4611686018427387903);
+}
+
+// Unsigned i64 -> decimal string (heap). For cache filenames.
+fn u64_to_str(n as i64) as *u8 {
+    let is [24]u8 as buf;
+    let is i32 as pos with mut = 23;
+    let is i64 as v with mut = n;
+    if (v == 0) { buf[pos] = 48; pos = pos - 1; }
+    else { while (v > 0) { buf[pos] = cast(u8, 48 + cast(i32, v % 10)); v = v / 10; pos = pos - 1; } }
+    let is i32 as start = pos + 1;
+    let is i32 as slen = 24 - start;
+    let is *u8 as out = galloc(cast(i64, slen) + 1);
+    let is i32 as j with mut = 0;
+    while (j < slen) { out[j] = buf[start + j]; j = j + 1; }
+    out[slen] = cast(u8, 0);
+    return out;
+}
+
+// Mangle a source path to the compiler's module prefix: "_" + path with
+// '/' '.' '\' '-' replaced by '_'. Mirrors scope.cst:get_mod_prefix so the
+// maker can derive a module's entry/symbol prefix (e.g. "src/main.cst" ->
+// "_src_main_cst").
+fn mangle_path(path as *u8) as *u8 {
+    let is i64 as len = strlen(path);
+    let is *u8 as out = galloc(len + 2);
+    out[0] = 95;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is u8 as ch = path[i];
+        if (ch == 47 || ch == 46 || ch == 92 || ch == 45) { out[i + 1] = 95; }
+        else { out[i + 1] = ch; }
+        i = i + 1;
+    }
+    out[len + 1] = cast(u8, 0);
+    return out;
+}
