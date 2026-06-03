@@ -177,15 +177,21 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     sys.mkdir_p(sys.CACHE_DIR);
     sys.mkdir_p(".caustic/obj");
 
-    // 1. Module dependency graph — the compiler resolves every import and lists
-    //    each module's canonical path. This is a full frontend pass (~400 ms
-    //    for the compiler), so the list is CACHED: it only changes when a `use`
-    //    statement is added/removed. Editing module bodies reuses it. A missing
-    //    new import surfaces as a link error → `caustic-mk clean` to refresh.
+    // 1. Module dependency graph + cold-build objects in ONE frontend pass.
+    //    The dep list (each module's canonical path) is CACHED — it only changes
+    //    when a `use` is added/removed (a missing new import → link error →
+    //    `caustic-mk clean`). On a COLD build (no cached list) a single
+    //    `--module-objects` process does the whole-program frontend ONCE and
+    //    writes BOTH the dep list AND every object, folding the separate
+    //    emit-deps frontend pass (~455 ms saved).
+    sys.mkdir_p(".caustic/batch");
+    let is i32 as use_batch with mut = 0;
     if (sys.file_exists(".caustic/deps.txt") == 0) {
-        let is *u8 as ec with mut = c.str_cat3(caustic_bin, " ", src);
-        ec = c.str_cat(ec, " --emit-deps .caustic/deps.txt -q");
-        if (sys.run_cmd(ec) != 0) { c.eprint("incremental: emit-deps failed\n"); return 1; }
+        let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects .caustic/batch ", src);
+        bc = c.str_cat(bc, " -q >/dev/null");
+        if (sys.run_cmd(bc) != 0) { c.eprint("incremental: cold batch build failed\n"); return 1; }
+        sys.run_cmd("mv .caustic/batch/deps.txt .caustic/deps.txt");
+        use_batch = 1;
     }
     let is *u8 as deps_buf = c.read_file(".caustic/deps.txt");
     if (cast(i64, deps_buf) == 0) { c.eprint("incremental: cannot read deps list\n"); return 1; }
@@ -220,25 +226,23 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     //    closure — slower first build, but no `.csti` machinery).
     let is i32 as STAGE3_CSTI with imut = 1;
 
-    // Cold/clean build fast path: when MANY modules are uncached (first build),
-    // a SINGLE `--module-objects` process emits every object from one whole-
-    // program frontend — far cheaper than N per-module compiler+assembler
-    // spawns. The dev-loop (a handful changed) keeps the per-module path, which
-    // recompiles only what changed.
-    let is i32 as uncached with mut = 0;
-    let is i32 as ui with mut = 0;
-    while (ui < nmod) {
-        let is *u8 as ump = c.str_dup(cast(*u8, cast(i64, deps_buf) + mod_off[ui]), mod_len[ui]);
-        let is *u8 as uob = c.str_cat3(".caustic/obj/", c.u64_to_str(c.hash_file(ump)), ".o");
-        if (sys.file_exists(uob) == 0) { uncached = uncached + 1; }
-        ui = ui + 1;
-    }
-    let is i32 as use_batch with mut = 0;
-    if (uncached > 8) {
-        sys.mkdir_p(".caustic/batch");
-        let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects .caustic/batch ", src);
-        bc = c.str_cat(bc, " -q >/dev/null");
-        if (sys.run_cmd(bc) == 0) { use_batch = 1; }
+    // Warm build that changed MANY modules (rare): one batch beats many
+    // per-module spawns. (Cold builds already batched above; the common
+    // dev-loop — a handful changed — falls through to the per-module path.)
+    if (use_batch == 0) {
+        let is i32 as uncached with mut = 0;
+        let is i32 as ui with mut = 0;
+        while (ui < nmod) {
+            let is *u8 as ump = c.str_dup(cast(*u8, cast(i64, deps_buf) + mod_off[ui]), mod_len[ui]);
+            let is *u8 as uob = c.str_cat3(".caustic/obj/", c.u64_to_str(c.hash_file(ump)), ".o");
+            if (sys.file_exists(uob) == 0) { uncached = uncached + 1; }
+            ui = ui + 1;
+        }
+        if (uncached > 8) {
+            let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects .caustic/batch ", src);
+            bc = c.str_cat(bc, " -q >/dev/null");
+            if (sys.run_cmd(bc) == 0) { use_batch = 1; }
+        }
     }
 
     let is *u8 as objs with mut = c.str_dup("", 0);
