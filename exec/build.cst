@@ -219,6 +219,28 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     //    plain `--module-only` per-module build (each module re-analyzes its import
     //    closure — slower first build, but no `.csti` machinery).
     let is i32 as STAGE3_CSTI with imut = 1;
+
+    // Cold/clean build fast path: when MANY modules are uncached (first build),
+    // a SINGLE `--module-objects` process emits every object from one whole-
+    // program frontend — far cheaper than N per-module compiler+assembler
+    // spawns. The dev-loop (a handful changed) keeps the per-module path, which
+    // recompiles only what changed.
+    let is i32 as uncached with mut = 0;
+    let is i32 as ui with mut = 0;
+    while (ui < nmod) {
+        let is *u8 as ump = c.str_dup(cast(*u8, cast(i64, deps_buf) + mod_off[ui]), mod_len[ui]);
+        let is *u8 as uob = c.str_cat3(".caustic/obj/", c.u64_to_str(c.hash_file(ump)), ".o");
+        if (sys.file_exists(uob) == 0) { uncached = uncached + 1; }
+        ui = ui + 1;
+    }
+    let is i32 as use_batch with mut = 0;
+    if (uncached > 8) {
+        sys.mkdir_p(".caustic/batch");
+        let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects .caustic/batch ", src);
+        bc = c.str_cat(bc, " -q >/dev/null");
+        if (sys.run_cmd(bc) == 0) { use_batch = 1; }
+    }
+
     let is *u8 as objs with mut = c.str_dup("", 0);
     let is i32 as rebuilt with mut = 0;
     let is i32 as reused with mut = 0;
@@ -233,22 +255,34 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
         }
         let is *u8 as obj = c.str_cat3(".caustic/obj/", c.u64_to_str(h), ".o");
         if (sys.file_exists(obj) == 0) {
-            let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", modpath);
-            if (STAGE3_CSTI == 1) { cc = c.str_cat(cc, " --emit-csti --csti-dir .caustic/csti"); }
-            cc = c.str_cat(cc, " -q >/dev/null");
-            if (sys.run_cmd(cc) != 0) {
-                c.eprint("incremental: compile failed: "); c.eprint(modpath); c.write_nl(2);
-                return 1;
+            if (use_batch == 1) {
+                // The cold-path batch already emitted this module's object in
+                // one process; move it into the hash-keyed cache.
+                let is *u8 as bobj = c.str_cat3(".caustic/batch/", c.mangle_path(modpath), ".o");
+                let is *u8 as bmv with mut = c.str_cat3("mv ", bobj, " ");
+                bmv = c.str_cat(bmv, obj);
+                if (sys.run_cmd(bmv) != 0) {
+                    c.eprint("incremental: batch object missing: "); c.eprint(bobj); c.write_nl(2);
+                    return 1;
+                }
+            } else {
+                let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", modpath);
+                if (STAGE3_CSTI == 1) { cc = c.str_cat(cc, " --emit-csti --csti-dir .caustic/csti"); }
+                cc = c.str_cat(cc, " -q >/dev/null");
+                if (sys.run_cmd(cc) != 0) {
+                    c.eprint("incremental: compile failed: "); c.eprint(modpath); c.write_nl(2);
+                    return 1;
+                }
+                let is *u8 as ac with mut = c.str_cat3(as_bin, " ", modpath);
+                ac = c.str_cat(ac, ".s >/dev/null");
+                if (sys.run_cmd(ac) != 0) {
+                    c.eprint("incremental: assemble failed: "); c.eprint(modpath); c.write_nl(2);
+                    return 1;
+                }
+                let is *u8 as mv with mut = c.str_cat3("mv ", modpath, ".s.o ");
+                mv = c.str_cat(mv, obj);
+                sys.run_cmd(mv);
             }
-            let is *u8 as ac with mut = c.str_cat3(as_bin, " ", modpath);
-            ac = c.str_cat(ac, ".s >/dev/null");
-            if (sys.run_cmd(ac) != 0) {
-                c.eprint("incremental: assemble failed: "); c.eprint(modpath); c.write_nl(2);
-                return 1;
-            }
-            let is *u8 as mv with mut = c.str_cat3("mv ", modpath, ".s.o ");
-            mv = c.str_cat(mv, obj);
-            sys.run_cmd(mv);
             rebuilt = rebuilt + 1;
         } else {
             reused = reused + 1;
