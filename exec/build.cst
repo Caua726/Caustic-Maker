@@ -190,48 +190,71 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     let is *u8 as deps_buf = c.read_file(".caustic/deps.txt");
     if (cast(i64, deps_buf) == 0) { c.eprint("incremental: cannot read deps list\n"); return 1; }
 
-    // 2. Per-module: reuse cached object if the source is unchanged, else
-    //    compile (--module-only) + assemble, then cache the object by hash.
-    let is *u8 as objs with mut = c.str_dup("", 0);
+    // Parse the dep list into an indexable array. The list is DFS pre-order
+    // (root first, a module's descendants contiguously after it), so iterating it
+    // in REVERSE visits dependencies before dependents (≈ topological).
+    sys.mkdir_p(".caustic/csti");
+    let is [1024]i64 as mod_off;
+    let is [1024]i32 as mod_len;
+    let is i32 as nmod with mut = 0;
     let is i64 as p with mut = 0;
-    let is i32 as rebuilt with mut = 0;
-    let is i32 as reused with mut = 0;
-    while (deps_buf[p] != cast(u8, 0)) {
+    while (deps_buf[p] != cast(u8, 0) && nmod < 1024) {
         let is i64 as start = p;
         while (deps_buf[p] != cast(u8, 0) && deps_buf[p] != cast(u8, 10)) { p = p + 1; }
         let is i32 as mlen = cast(i32, p - start);
         if (deps_buf[p] == cast(u8, 10)) { p = p + 1; }
-        if (mlen > 0) {
-            let is *u8 as modpath = c.str_dup(cast(*u8, cast(i64, deps_buf) + start), mlen);
-            let is i64 as h = c.hash_file(modpath);
-            if (h == 0) {
-                c.eprint("incremental: cannot read module ");
-                c.eprint(modpath); c.write_nl(2);
+        if (mlen > 0) { mod_off[nmod] = start; mod_len[nmod] = mlen; nmod = nmod + 1; }
+    }
+
+    // 2. SINGLE pass in dependency (topological) order. `--emit-deps` now lists
+    //    modules in POST-order (dependencies before dependents), so iterating
+    //    FORWARD compiles every module after its deps. For each non-cached module,
+    //    ONE compiler invocation both compiles it `--module-only` (reading its
+    //    already-built deps from their `.csti`, skipping their body re-analysis) AND
+    //    emits its own `.csti` (`--emit-csti`) — a single analysis per module, with
+    //    no source fallbacks, is what makes the first/clean build fast. The `.o` is
+    //    cached by source hash; a cached module's `.csti` persists from its build.
+    //
+    //    STAGE3_CSTI gates the whole `.csti` mechanism. With it off, this is the
+    //    plain `--module-only` per-module build (each module re-analyzes its import
+    //    closure — slower first build, but no `.csti` machinery).
+    let is i32 as STAGE3_CSTI with imut = 1;
+    let is *u8 as objs with mut = c.str_dup("", 0);
+    let is i32 as rebuilt with mut = 0;
+    let is i32 as reused with mut = 0;
+    let is i32 as ci with mut = 0;
+    while (ci < nmod) {
+        let is *u8 as modpath = c.str_dup(cast(*u8, cast(i64, deps_buf) + mod_off[ci]), mod_len[ci]);
+        let is i64 as h = c.hash_file(modpath);
+        if (h == 0) {
+            c.eprint("incremental: cannot read module ");
+            c.eprint(modpath); c.write_nl(2);
+            return 1;
+        }
+        let is *u8 as obj = c.str_cat3(".caustic/obj/", c.u64_to_str(h), ".o");
+        if (sys.file_exists(obj) == 0) {
+            let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", modpath);
+            if (STAGE3_CSTI == 1) { cc = c.str_cat(cc, " --emit-csti --csti-dir .caustic/csti"); }
+            cc = c.str_cat(cc, " -q >/dev/null");
+            if (sys.run_cmd(cc) != 0) {
+                c.eprint("incremental: compile failed: "); c.eprint(modpath); c.write_nl(2);
                 return 1;
             }
-            let is *u8 as obj = c.str_cat3(".caustic/obj/", c.u64_to_str(h), ".o");
-            if (sys.file_exists(obj) == 0) {
-                let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", modpath);
-                cc = c.str_cat(cc, " -q >/dev/null");
-                if (sys.run_cmd(cc) != 0) {
-                    c.eprint("incremental: compile failed: "); c.eprint(modpath); c.write_nl(2);
-                    return 1;
-                }
-                let is *u8 as ac with mut = c.str_cat3(as_bin, " ", modpath);
-                ac = c.str_cat(ac, ".s >/dev/null");
-                if (sys.run_cmd(ac) != 0) {
-                    c.eprint("incremental: assemble failed: "); c.eprint(modpath); c.write_nl(2);
-                    return 1;
-                }
-                let is *u8 as mv with mut = c.str_cat3("mv ", modpath, ".s.o ");
-                mv = c.str_cat(mv, obj);
-                sys.run_cmd(mv);
-                rebuilt = rebuilt + 1;
-            } else {
-                reused = reused + 1;
+            let is *u8 as ac with mut = c.str_cat3(as_bin, " ", modpath);
+            ac = c.str_cat(ac, ".s >/dev/null");
+            if (sys.run_cmd(ac) != 0) {
+                c.eprint("incremental: assemble failed: "); c.eprint(modpath); c.write_nl(2);
+                return 1;
             }
-            objs = c.str_cat3(objs, " ", obj);
+            let is *u8 as mv with mut = c.str_cat3("mv ", modpath, ".s.o ");
+            mv = c.str_cat(mv, obj);
+            sys.run_cmd(mv);
+            rebuilt = rebuilt + 1;
+        } else {
+            reused = reused + 1;
         }
+        objs = c.str_cat3(objs, " ", obj);
+        ci = ci + 1;
     }
 
     // 3. Link all objects. The entry is the main module's mangled `_main`.
