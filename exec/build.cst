@@ -74,12 +74,10 @@ fn _prepare_output_path(t as *parser.Target, target_name as *u8) as *u8 {
     return out_path;
 }
 
-// Assemble the full `caustic <src> -o <tmp_out> ...` invocation: flags, CSE
-// mode/extension, allow-unsupported, app-version, dependency --path, system -l.
-fn _build_compile_cmd(t as *parser.Target, proj as *parser.Project, caustic_bin as *u8, src as *u8, tmp_out as *u8) as *u8 {
-    let is *u8 as cmd with mut = c.str_cat3(caustic_bin, " ", src);
-    cmd = c.str_cat3(cmd, " -o ", tmp_out);
-    cmd = c.str_cat(cmd, " --cache .caustic");
+// Flags every compile step gets, one-shot or staged: user `flags`, CSE
+// mode/extension, allow-unsupported, app-version, dependency --path.
+fn _compile_tail(t as *parser.Target, proj as *parser.Project) as *u8 {
+    let is *u8 as cmd with mut = c.str_dup("", 0);
     if (t.flags_len > 0) {
         let is *u8 as flags = c.str_dup(t.flags_ptr, t.flags_len);
         cmd = c.str_cat3(cmd, " ", flags);
@@ -110,25 +108,48 @@ fn _build_compile_cmd(t as *parser.Target, proj as *parser.Project, caustic_bin 
         cmd = c.str_cat3(cmd, " --path ", pd_dir);
         pd = cast(*parser.Dep, pd.next);
     }
-    // append -l for each system lib
-    let is i32 as sli with mut = 0;
-    while (sli < parser.system_lib_count) {
-        let is *u8 as lib_name = c.str_dup(cast(*u8, parser.system_lib_ptrs[sli]), parser.system_lib_lens[sli]);
-        cmd = c.str_cat3(cmd, " -l", lib_name);
-        sli = sli + 1;
-    }
     return cmd;
 }
 
-// Run the compile command and atomically swap the temp output into place.
-fn _run_compile(cmd as *u8, out_path as *u8, tmp_out as *u8) as i32 {
-    let is i32 as rc = sys.run_cmd(cmd);
+// " -l<name>" for every `system` lib (the Causticfile's and any pulled in from
+// a dependency's Causticfile). Consumed by whichever step does the linking.
+fn _sys_libs() as *u8 {
+    let is *u8 as out with mut = c.str_dup("", 0);
+    let is i32 as sli with mut = 0;
+    while (sli < parser.system_lib_count) {
+        let is *u8 as lib_name = c.str_dup(parser.system_lib_ptr(sli), parser.system_lib_len(sli));
+        out = c.str_cat3(out, " -l", lib_name);
+        sli = sli + 1;
+    }
+    return out;
+}
+
+// Assemble the full `caustic <src> -o <tmp_out> ...` invocation for the
+// one-shot path (compiler drives its own assembler + linker).
+fn _build_compile_cmd(t as *parser.Target, proj as *parser.Project, caustic_bin as *u8, src as *u8, tmp_out as *u8) as *u8 {
+    let is *u8 as cmd with mut = c.str_cat3(caustic_bin, " ", src);
+    cmd = c.str_cat3(cmd, " -o ", tmp_out);
+    cmd = c.str_cat(cmd, " --cache .caustic");
+    cmd = c.str_cat(cmd, _compile_tail(t, proj));
+    cmd = c.str_cat(cmd, _sys_libs());
+    return cmd;
+}
+
+// Every build step runs with the project's + the target's declared `env`
+// applied, so `flags "--path $CAUSTIC_DIR/std"` and friends resolve.
+fn _run_step(t as *parser.Target, proj as *parser.Project, cmd as *u8) as i32 {
+    return sys.run_cmd_env(cmd, cast(*parser.EnvVar, proj.env), cast(*parser.EnvVar, t.env),
+                           cast(*i64, 0), 0);
+}
+
+// Swap the temp output into place (avoids overwriting a running binary) and
+// report. `rc` is the exit code of the step that produced tmp_out.
+fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
     if (rc != 0) {
         c.eprint("error: build failed");
         c.write_nl(2);
         return rc;
     }
-    // rename tmp -> final (avoids overwriting a running binary)
     io.unlink(out_path);
     io.rename(tmp_out, out_path);
     c.print("  built: ");
@@ -154,7 +175,172 @@ fn run_pipeline(t as *parser.Target, proj as *parser.Project) as i32 {
     // link to temp first, then rename (avoids overwriting running binary)
     let is *u8 as tmp_out = c.str_cat(out_path, ".tmp");
     let is *u8 as cmd = _build_compile_cmd(t, proj, caustic_bin, src, tmp_out);
-    return _run_compile(cmd, out_path, tmp_out);
+    return _finish_output(_run_step(t, proj, cmd), out_path, tmp_out);
+}
+
+// ── Staged build (multi-object targets) ───────────────────────
+// The one-shot `caustic <src> -o <out>` path links exactly one object and only
+// accepts flags the COMPILER knows, so it cannot express either half of what a
+// kernel-shaped target needs: extra objects (hand-written .s, prebuilt .o, a
+// module the main source doesn't `use`) and linker-only flags (--strip, --map,
+// …, which `caustic` rejects as unknown options).
+//
+// A target that declares `source` / `asm` / `obj` / `ldflags` therefore runs
+// the pipeline by hand, exactly as the equivalent shell script would:
+//
+//   caustic -c <src> <flags>          -> <src>.s
+//   caustic-as <src>.s                -> <src>.s.o
+//   caustic --module-only <source>    -> <source>.s        (per `source`)
+//   caustic-as <source>.s             -> <source>.s.o
+//   caustic-as <asm>                  -> <asm>.o           (per `asm`)
+//   caustic-ld <objs…> <ldflags> -o <out>
+//
+// Objects reach the linker in declaration order, main source first.
+fn is_staged(t as *parser.Target) as i32 {
+    if (t.input_count > 0) { return 1; }
+    if (t.ldflags_len > 0) { return 1; }
+    if (t.asflags_len > 0) { return 1; }
+    return 0;
+}
+
+// The target triple lives in `flags` (compiler-facing), but caustic-as and
+// caustic-ld need it too — forward it unless the step's own flags set one.
+fn _forward_triple(t as *parser.Target, own_flags as *u8) as *u8 {
+    if (c.contains(own_flags, "--target=") == 1) { return c.str_dup("", 0); }
+    if (t.flags_len == 0) { return c.str_dup("", 0); }
+    let is *u8 as flags = c.str_dup(t.flags_ptr, t.flags_len);
+    let is *u8 as triple = c.extract_flag(flags, "--target=");
+    if (cast(i64, triple) == 0) { return c.str_dup("", 0); }
+    return c.str_cat(" ", triple);
+}
+
+// caustic-as <path> <asflags> [--target=…]  ->  <path>.o
+fn _assemble(t as *parser.Target, proj as *parser.Project, as_bin as *u8, path as *u8) as i32 {
+    let is *u8 as asflags with mut = c.str_dup("", 0);
+    if (t.asflags_len > 0) { asflags = c.str_dup(t.asflags_ptr, t.asflags_len); }
+    let is *u8 as cmd with mut = c.str_cat3(as_bin, " ", path);
+    if (t.asflags_len > 0) { cmd = c.str_cat3(cmd, " ", asflags); }
+    cmd = c.str_cat(cmd, _forward_triple(t, asflags));
+    let is i32 as rc = _run_step(t, proj, cmd);
+    if (rc != 0) {
+        c.eprint("error: assemble failed: ");
+        c.eprint(path);
+        c.write_nl(2);
+    }
+    return rc;
+}
+
+fn run_pipeline_staged(t as *parser.Target, proj as *parser.Project) as i32 {
+    let is *u8 as src = c.str_dup(t.src_ptr, t.src_len);
+    let is *u8 as target_name = c.str_dup(t.name_ptr, t.name_len);
+    _generate_version(proj, src);
+
+    let is *u8 as caustic_bin = sys.find_tool("caustic");
+    let is *u8 as as_bin = sys.find_tool("caustic-as");
+    let is *u8 as ld_bin = sys.find_tool("caustic-ld");
+    sys.mkdir_p(sys.CACHE_DIR);
+
+    let is *u8 as objs with mut = c.str_dup("", 0);
+
+    // 1. main source: compile only, then assemble.
+    if (t.src_len > 0) {
+        let is *u8 as cc with mut = c.str_cat3(caustic_bin, " -c ", src);
+        cc = c.str_cat(cc, " --cache .caustic");
+        cc = c.str_cat(cc, _compile_tail(t, proj));
+        if (_run_step(t, proj, cc) != 0) {
+            c.eprint("error: compile failed: ");
+            c.eprint(src);
+            c.write_nl(2);
+            return 1;
+        }
+        let is *u8 as main_s = c.str_cat(src, ".s");
+        if (_assemble(t, proj, as_bin, main_s) != 0) { return 1; }
+        objs = c.str_cat3(objs, " ", c.str_cat(main_s, ".o"));
+    }
+
+    // 2. extra inputs, in declaration order.
+    let is *u8 as extra = _extra_objects(t, proj, caustic_bin, as_bin);
+    if (cast(i64, extra) == 0) { return 1; }
+    objs = c.str_cat(objs, extra);
+
+    // 3. link everything.
+    return _link_objects(t, proj, ld_bin, objs, target_name, cast(*u8, 0));
+}
+
+// Build (or just collect) every extra link input a target declares, in
+// declaration order, and return them as a " obj1 obj2 …" fragment. Null on
+// failure — the message is already printed.
+fn _extra_objects(t as *parser.Target, proj as *parser.Project, caustic_bin as *u8, as_bin as *u8) as *u8 {
+    let is *u8 as objs with mut = c.str_dup("", 0);
+    let is *parser.Input as inp with mut = cast(*parser.Input, t.inputs);
+    while (cast(i64, inp) != 0) {
+        let is *u8 as path = c.str_dup(inp.path_ptr, inp.path_len);
+        if (inp.kind == parser.IN_SRC) {
+            // --module-only: emit just this module's own functions (externs for
+            // the rest). A module the main source already `use`s is compiled
+            // into the main object — listing it here would duplicate symbols.
+            let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", path);
+            cc = c.str_cat(cc, " --cache .caustic");
+            cc = c.str_cat(cc, _compile_tail(t, proj));
+            if (_run_step(t, proj, cc) != 0) {
+                c.eprint("error: compile failed: ");
+                c.eprint(path);
+                c.write_nl(2);
+                return cast(*u8, 0);
+            }
+            let is *u8 as mod_s = c.str_cat(path, ".s");
+            if (_assemble(t, proj, as_bin, mod_s) != 0) { return cast(*u8, 0); }
+            objs = c.str_cat3(objs, " ", c.str_cat(mod_s, ".o"));
+        } else if (inp.kind == parser.IN_ASM) {
+            if (sys.file_exists(path) == 0) {
+                c.eprint("error: asm input not found: ");
+                c.eprint(path);
+                c.write_nl(2);
+                return cast(*u8, 0);
+            }
+            if (_assemble(t, proj, as_bin, path) != 0) { return cast(*u8, 0); }
+            objs = c.str_cat3(objs, " ", c.str_cat(path, ".o"));
+        } else {
+            if (sys.file_exists(path) == 0) {
+                c.eprint("error: obj input not found: ");
+                c.eprint(path);
+                c.write_nl(2);
+                return cast(*u8, 0);
+            }
+            objs = c.str_cat3(objs, " ", path);
+        }
+        inp = cast(*parser.Input, inp.next);
+    }
+    return objs;
+}
+
+// Link an object list into the target's output. `auto_entry` is the entry
+// symbol to use when the target's own ldflags don't name one (the incremental
+// path passes the main module's mangled `_main`; the staged path passes null and
+// lets caustic-ld default to `main`, which is what a `-c` object exports).
+fn _link_objects(t as *parser.Target, proj as *parser.Project, ld_bin as *u8,
+                 objs as *u8, target_name as *u8, auto_entry as *u8) as i32 {
+    let is *u8 as out_path = _prepare_output_path(t, target_name);
+    let is *u8 as tmp_out = c.str_cat(out_path, ".tmp");
+    let is *u8 as ldflags with mut = c.str_dup("", 0);
+    if (t.ldflags_len > 0) { ldflags = c.str_dup(t.ldflags_ptr, t.ldflags_len); }
+    let is *u8 as lc with mut = c.str_cat(ld_bin, objs);
+    if (t.ldflags_len > 0) { lc = c.str_cat3(lc, " ", ldflags); }
+    lc = c.str_cat(lc, _forward_triple(t, ldflags));
+    if (cast(i64, auto_entry) != 0 && c.contains(ldflags, "--entry=") == 0) {
+        lc = c.str_cat3(lc, " --entry=", auto_entry);
+    }
+    // CSE mode/extension decide the linker's output flavour, so they go to the
+    // link step too (the compiler only saw them for codegen).
+    if (t.mode_len > 0 && c.contains(ldflags, "--mode=") == 0) {
+        lc = c.str_cat3(lc, " --mode=", c.str_dup(t.mode_ptr, t.mode_len));
+    }
+    if (t.extension_len > 0 && c.contains(ldflags, "--extension=") == 0) {
+        lc = c.str_cat3(lc, " --extension=", c.str_dup(t.extension_ptr, t.extension_len));
+    }
+    lc = c.str_cat(lc, _sys_libs());
+    lc = c.str_cat3(lc, " -o ", tmp_out);
+    return _finish_output(_run_step(t, proj, lc), out_path, tmp_out);
 }
 
 // ── Incremental build (separate compilation) ──────────────────
@@ -184,27 +370,50 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     //    `--module-objects` process does the whole-program frontend ONCE and
     //    writes BOTH the dep list AND every object, folding the separate
     //    emit-deps frontend pass (~455 ms saved).
-    sys.mkdir_p(".caustic/batch");
+    //    Both the list and the batch directory are keyed on the TARGET's source:
+    //    a single shared .caustic/deps.txt made a second target reuse the first
+    //    one's module list (and then fail to find its entry point, or worse link
+    //    the wrong program).
+    let is *u8 as key = c.mangle_path(src);
+    let is *u8 as deps_file = c.str_cat3(".caustic/deps", key, ".txt");
+    let is *u8 as batch_dir = c.str_cat(".caustic/batch", key);
+    sys.mkdir_p(batch_dir);
     let is i32 as use_batch with mut = 0;
-    if (sys.file_exists(".caustic/deps.txt") == 0) {
-        let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects .caustic/batch ", src);
+    if (sys.file_exists(deps_file) == 0) {
+        let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects ", batch_dir);
+        bc = c.str_cat3(bc, " ", src);
+        // The target's own compile flags apply here too — without them a target
+        // that needs `--path` (module search dirs) can't resolve its imports.
+        bc = c.str_cat(bc, _compile_tail(t, proj));
         bc = c.str_cat(bc, " -q >/dev/null");
-        if (sys.run_cmd(bc) != 0) { c.eprint("incremental: cold batch build failed\n"); return 1; }
-        sys.run_cmd("mv .caustic/batch/deps.txt .caustic/deps.txt");
+        if (_run_step(t, proj, bc) != 0) { c.eprint("incremental: cold batch build failed\n"); return 1; }
+        let is *u8 as mvd with mut = c.str_cat3("mv ", batch_dir, "/deps.txt ");
+        mvd = c.str_cat(mvd, deps_file);
+        if (sys.run_cmd(mvd) != 0) { c.eprint("incremental: no deps list from batch build\n"); return 1; }
         use_batch = 1;
     }
-    let is *u8 as deps_buf = c.read_file(".caustic/deps.txt");
+    let is *u8 as deps_buf = c.read_file(deps_file);
     if (cast(i64, deps_buf) == 0) { c.eprint("incremental: cannot read deps list\n"); return 1; }
 
     // Parse the dep list into an indexable array. The list is DFS pre-order
     // (root first, a module's descendants contiguously after it), so iterating it
     // in REVERSE visits dependencies before dependents (≈ topological).
     sys.mkdir_p(".caustic/csti");
-    let is [1024]i64 as mod_off;
-    let is [1024]i32 as mod_len;
+    // Sized from the list itself (one entry per line) rather than a fixed
+    // [1024]: a project past the old cap silently lost its trailing modules and
+    // then failed at link with undefined symbols.
+    let is i64 as dline with mut = 0;
+    let is i64 as dscan with mut = 0;
+    while (deps_buf[dscan] != cast(u8, 0)) {
+        if (deps_buf[dscan] == cast(u8, 10)) { dline = dline + 1; }
+        dscan = dscan + 1;
+    }
+    dline = dline + 2;   // last line may lack a trailing newline
+    let is *i64 as mod_off = cast(*i64, c.big_alloc(dline * 8));
+    let is *i32 as mod_len = cast(*i32, c.big_alloc(dline * 4));
     let is i32 as nmod with mut = 0;
     let is i64 as p with mut = 0;
-    while (deps_buf[p] != cast(u8, 0) && nmod < 1024) {
+    while (deps_buf[p] != cast(u8, 0)) {
         let is i64 as start = p;
         while (deps_buf[p] != cast(u8, 0) && deps_buf[p] != cast(u8, 10)) { p = p + 1; }
         let is i32 as mlen = cast(i32, p - start);
@@ -239,9 +448,11 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
             ui = ui + 1;
         }
         if (uncached > 8) {
-            let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects .caustic/batch ", src);
+            let is *u8 as bc with mut = c.str_cat3(caustic_bin, " --module-objects ", batch_dir);
+            bc = c.str_cat3(bc, " ", src);
+            bc = c.str_cat(bc, _compile_tail(t, proj));
             bc = c.str_cat(bc, " -q >/dev/null");
-            if (sys.run_cmd(bc) == 0) { use_batch = 1; }
+            if (_run_step(t, proj, bc) == 0) { use_batch = 1; }
         }
     }
 
@@ -262,7 +473,8 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
             if (use_batch == 1) {
                 // The cold-path batch already emitted this module's object in
                 // one process; move it into the hash-keyed cache.
-                let is *u8 as bobj = c.str_cat3(".caustic/batch/", c.mangle_path(modpath), ".o");
+                let is *u8 as bobj with mut = c.str_cat3(batch_dir, "/", c.mangle_path(modpath));
+                bobj = c.str_cat(bobj, ".o");
                 let is *u8 as bmv with mut = c.str_cat3("mv ", bobj, " ");
                 bmv = c.str_cat(bmv, obj);
                 if (sys.run_cmd(bmv) != 0) {
@@ -272,14 +484,15 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
             } else {
                 let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", modpath);
                 if (STAGE3_CSTI == 1) { cc = c.str_cat(cc, " --emit-csti --csti-dir .caustic/csti"); }
+                cc = c.str_cat(cc, _compile_tail(t, proj));
                 cc = c.str_cat(cc, " -q >/dev/null");
-                if (sys.run_cmd(cc) != 0) {
+                if (_run_step(t, proj, cc) != 0) {
                     c.eprint("incremental: compile failed: "); c.eprint(modpath); c.write_nl(2);
                     return 1;
                 }
                 let is *u8 as ac with mut = c.str_cat3(as_bin, " ", modpath);
                 ac = c.str_cat(ac, ".s >/dev/null");
-                if (sys.run_cmd(ac) != 0) {
+                if (_run_step(t, proj, ac) != 0) {
                     c.eprint("incremental: assemble failed: "); c.eprint(modpath); c.write_nl(2);
                     return 1;
                 }
@@ -295,21 +508,25 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
         ci = ci + 1;
     }
 
-    // 3. Link all objects. The entry is the main module's mangled `_main`.
-    let is *u8 as out_path = _prepare_output_path(t, target_name);
-    let is *u8 as tmp_out = c.str_cat(out_path, ".tmp");
-    let is *u8 as lc with mut = c.str_cat(ld_bin, objs);
-    lc = c.str_cat3(lc, " --entry=", c.mangle_path(src));
-    lc = c.str_cat3(lc, "_main -o ", tmp_out);
-    if (sys.run_cmd(lc) != 0) { c.eprint("incremental: link failed\n"); return 1; }
-    sys.run_cmd(c.str_cat(c.str_cat3("mv ", tmp_out, " "), out_path));
+    // 3. The target's own extra inputs (hand-written .s, prebuilt .o, a module
+    //    outside the `use` graph) join the module objects — an incremental build
+    //    of a multi-object target links the same set as a staged one.
+    let is *u8 as extra = _extra_objects(t, proj, caustic_bin, as_bin);
+    if (cast(i64, extra) == 0) { return 1; }
+    objs = c.str_cat(objs, extra);
+
+    // 4. Link all objects. Unless `ldflags` names an entry, it's the main
+    //    module's mangled `_main` (every module here was compiled --module-only).
+    let is *u8 as auto_entry = c.str_cat(c.mangle_path(src), "_main");
+    let is i32 as lrc = _link_objects(t, proj, ld_bin, objs, target_name, auto_entry);
+    if (lrc != 0) { return lrc; }
 
     c.print("incremental: ");
     c.print(c.u64_to_str(cast(i64, rebuilt)));
     c.print(" rebuilt, ");
     c.print(c.u64_to_str(cast(i64, reused)));
-    c.print(" reused -> ");
-    c.print(out_path); c.write_nl(1);
+    c.print(" reused");
+    c.write_nl(1);
     return 0;
 }
 
@@ -323,14 +540,28 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32,
         return 1;
     }
 
-    // resolve target depends (another target)
-    if (t.depends_len > 0) {
-        let is *u8 as dep_name = c.str_dup(t.depends_ptr, t.depends_len);
+    // resolve target depends (other targets, in declaration order). `visiting`
+    // catches a cycle (a depends b depends a), which would otherwise recurse
+    // until the stack ran out.
+    if (t.visiting == 1) {
+        c.eprint("error: dependency cycle at target '");
+        c.eprint(target_name);
+        c.eprint("'");
+        c.write_nl(2);
+        return 1;
+    }
+    t.visiting = 1;
+    let is *parser.Name as dn with mut = cast(*parser.Name, t.depends);
+    while (cast(i64, dn) != 0) {
+        let is *u8 as dep_name = c.str_dup(dn.ptr, dn.len);
         let is i32 as rc = exec_build(proj, dep_name, continue_flag, incremental);
         if (rc != 0 && continue_flag == 0) {
+            t.visiting = 0;
             return rc;
         }
+        dn = cast(*parser.Name, dn.next);
     }
+    t.visiting = 0;
 
     // resolve external dependencies (git clone + system libs)
     let is i32 as dep_rc = deps.resolve_deps(t);
@@ -340,8 +571,23 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32,
     c.print(target_name);
     c.write_nl(1);
 
+    // A target with only `depends` is an aggregate ("build these"): its deps are
+    // already built above, so there is nothing left to compile.
+    if (t.src_len == 0 && t.input_count == 0) {
+        if (cast(i64, t.depends) != 0) { return 0; }
+        c.eprint("error: target '");
+        c.eprint(target_name);
+        c.eprint("' has no 'src' and no link inputs");
+        c.write_nl(2);
+        return 1;
+    }
+
     if (incremental == 1) {
         return run_pipeline_incremental(t, proj);
+    }
+    // Extra objects or linker-only flags ⇒ drive compile/assemble/link by hand.
+    if (is_staged(t) == 1) {
+        return run_pipeline_staged(t, proj);
     }
     return run_pipeline(t, proj);
 }

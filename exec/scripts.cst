@@ -5,12 +5,18 @@ use "../parser/parser.cst" as parser;
 
 // ── Script + lifecycle commands ───────────────────────────────
 
-fn run_script(proj as *parser.Project, scr as *parser.Script) as i32 {
+// Run every command of a script in order, each with the project's + the
+// script's declared environment applied and `args` as its positional
+// parameters ($1..$n, $@ — real shell positionals on Linux).
+fn run_script(proj as *parser.Project, scr as *parser.Script, args as *i64, argc as i64) as i32 {
     let is i32 as i with mut = 0;
     while (i < scr.cmd_count) {
         let is *parser.ScriptCmd as cmd = parser.get_script_cmd(scr, i);
         let is *u8 as cmd_str = c.str_dup(cmd.ptr, cmd.len);
-        let is i32 as rc = sys.run_cmd(cmd_str);
+        let is i32 as rc = sys.run_cmd_env(cmd_str,
+                                           cast(*parser.EnvVar, proj.env),
+                                           cast(*parser.EnvVar, scr.env),
+                                           args, argc);
         if (rc != 0) {
             return rc;
         }
@@ -19,11 +25,11 @@ fn run_script(proj as *parser.Project, scr as *parser.Script) as i32 {
     return 0;
 }
 
-fn exec_run(proj as *parser.Project, name as *u8) as i32 {
+fn exec_run(proj as *parser.Project, name as *u8, args as *i64, argc as i64) as i32 {
     // check scripts first
     let is *parser.Script as scr = sys.find_script(proj, name);
     if (cast(i64, scr) != 0) {
-        return run_script(proj, scr);
+        return run_script(proj, scr, args, argc);
     }
 
     // check targets - run the built binary
@@ -36,7 +42,16 @@ fn exec_run(proj as *parser.Project, name as *u8) as i32 {
             let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
             out_path = c.str_cat("build/", tname);
         }
-        return sys.run_cmd(out_path);
+        // The binary itself takes the arguments (quoted so paths with spaces
+        // survive the shell), not the shell that launches it.
+        let is *u8 as cmd with mut = out_path;
+        let is i64 as ai with mut = 0;
+        while (ai < argc) {
+            cmd = c.str_cat3(cmd, " ", sys.quote_arg(cast(*u8, args[ai])));
+            ai = ai + 1;
+        }
+        return sys.run_cmd_env(cmd, cast(*parser.EnvVar, proj.env),
+                               cast(*parser.EnvVar, t.env), cast(*i64, 0), 0);
     }
 
     c.eprint("error: '");
@@ -46,8 +61,8 @@ fn exec_run(proj as *parser.Project, name as *u8) as i32 {
     return 1;
 }
 
-fn exec_test(proj as *parser.Project) as i32 {
-    return exec_run(proj, "test");
+fn exec_test(proj as *parser.Project, args as *i64, argc as i64) as i32 {
+    return exec_run(proj, "test", args, argc);
 }
 
 fn exec_clean() as i32 {

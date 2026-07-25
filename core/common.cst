@@ -24,6 +24,40 @@ fn gfree(ptr as *u8) as void {
     if (_heap_ready == 1) { mem.bins.bins_free(&_heap, ptr); }
 }
 
+// === Large blocks (growable tables) ===
+// bins caps a single allocation at 64 KiB, so anything whose size follows the
+// Causticfile (the target/script tables, a whole source buffer) cannot live
+// there — a project with a few hundred targets would get a null back. Those
+// come straight from the page allocator, which is what makes the tables
+// unbounded: no MAX_TARGETS, no MAX_SCRIPTS, no MAX_CMDS.
+
+fn big_alloc(size as i64) as *u8 {
+    let is *u8 as p = mem.core.mmap_anon(size);
+    if (cast(i64, p) == 0) {
+        eprint("error: out of memory (");
+        eprint(u64_to_str(size));
+        eprint(" bytes)\n");
+        io.exit(1);
+    }
+    return p;
+}
+
+fn big_free(ptr as *u8, size as i64) as void {
+    if (cast(i64, ptr) != 0 && size > 0) { mem.core.munmap(ptr, size); }
+}
+
+// Reallocate a table: fresh mapping, copy the live prefix, release the old one.
+// Callers must not hold interior pointers across this (the parser only grows
+// a table before it hands out an element pointer).
+fn big_grow(old as *u8, old_size as i64, new_size as i64) as *u8 {
+    let is *u8 as nb = big_alloc(new_size);
+    if (cast(i64, old) != 0 && old_size > 0) {
+        mem.memcpy(nb, old, old_size);
+        big_free(old, old_size);
+    }
+    return nb;
+}
+
 // === String helpers ===
 
 fn strlen(s as *u8) as i64 {
@@ -114,6 +148,75 @@ fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
     return buf;
 }
 
+// Index of the first occurrence of `needle` in `s`, or -1.
+fn str_find(s as *u8, needle as *u8) as i64 {
+    let is i64 as sl = strlen(s);
+    let is i64 as nl = strlen(needle);
+    if (nl == 0) { return 0; }
+    if (nl > sl) { return 0 - 1; }
+    let is i64 as i with mut = 0;
+    while (i <= sl - nl) {
+        let is i64 as j with mut = 0;
+        while (j < nl && s[i + j] == needle[j]) { j = j + 1; }
+        if (j == nl) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn contains(s as *u8, needle as *u8) as i32 {
+    if (str_find(s, needle) >= 0) { return 1; }
+    return 0;
+}
+
+// Extract the whole whitespace-delimited token that starts with `prefix`
+// (e.g. "--target=" -> "--target=windows-x86_64"). Null if absent. Used to
+// forward a flag the user put in `flags` to the separate assemble/link steps.
+fn extract_flag(flags as *u8, prefix as *u8) as *u8 {
+    let is i64 as at = str_find(flags, prefix);
+    if (at < 0) { return cast(*u8, 0); }
+    let is i64 as end with mut = at;
+    let is i64 as fl = strlen(flags);
+    while (end < fl && flags[end] != 32 && flags[end] != 9) { end = end + 1; }
+    return str_dup(cast(*u8, cast(i64, flags) + at), cast(i32, end - at));
+}
+
+// Wrap (ptr,len) in POSIX-sh single quotes, escaping embedded quotes the only
+// way sh allows: '\''. Used for the `env` prologue so a declared value with
+// spaces or $ in it reaches the child verbatim.
+fn sh_quote_n(s as *u8, n as i32) as *u8 {
+    let is i64 as len = cast(i64, n);
+    let is i64 as quotes with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (s[i] == 39) { quotes = quotes + 1; }
+        i = i + 1;
+    }
+    // ' + body (each ' becomes 4 chars) + ' + NUL
+    let is *u8 as out = galloc(len + quotes * 3 + 3);
+    let is i64 as o with mut = 0;
+    out[o] = cast(u8, 39); o = o + 1;
+    i = 0;
+    while (i < len) {
+        if (s[i] == 39) {
+            out[o] = cast(u8, 39); o = o + 1;      // close
+            out[o] = cast(u8, 92); o = o + 1;      // backslash
+            out[o] = cast(u8, 39); o = o + 1;      // literal '
+            out[o] = cast(u8, 39); o = o + 1;      // reopen
+        } else {
+            out[o] = s[i]; o = o + 1;
+        }
+        i = i + 1;
+    }
+    out[o] = cast(u8, 39); o = o + 1;
+    out[o] = cast(u8, 0);
+    return out;
+}
+
+fn sh_quote(s as *u8) as *u8 {
+    return sh_quote_n(s, cast(i32, strlen(s)));
+}
+
 fn ends_with(s as *u8, suffix as *u8) as i32 {
     let is i64 as sl = strlen(s);
     let is i64 as fl = strlen(suffix);
@@ -137,7 +240,10 @@ fn read_file(path as *u8) as *u8 {
         io._close_fd(fd);
         return cast(*u8, 0);
     }
-    let is *u8 as buf = galloc(size + 1);
+    // Page-allocated, not galloc: a whole-file buffer has no upper bound, and
+    // bins would return null past 64 KiB. The buffer lives for the whole run
+    // (token pointers alias into it), so it is never freed.
+    let is *u8 as buf = big_alloc(size + 1);
     io._read_fd(fd, buf, size);
     buf[size] = 0;
     io._close_fd(fd);

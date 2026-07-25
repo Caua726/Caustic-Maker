@@ -31,12 +31,8 @@ fn collect_dep_system_libs(dep_dir as *u8) as void {
                 let is i64 as start = pos;
                 while (pos < cf_size && cf_src[pos] != 34) { pos = pos + 1; }
                 let is i32 as lib_len = cast(i32, pos - start);
-                if (parser.system_lib_count < 16) {
-                    let is *u8 as lib_copy = c.str_dup(cast(*u8, cast(i64, cf_src) + start), lib_len);
-                    parser.system_lib_ptrs[parser.system_lib_count] = cast(i64, lib_copy);
-                    parser.system_lib_lens[parser.system_lib_count] = lib_len;
-                    parser.system_lib_count = parser.system_lib_count + 1;
-                }
+                let is *u8 as lib_copy = c.str_dup(cast(*u8, cast(i64, cf_src) + start), lib_len);
+                parser.add_system_lib(lib_copy, lib_len);
                 if (pos < cf_size) { pos = pos + 1; }
             }
         } else {

@@ -1,4 +1,5 @@
 use "../std/io.cst" as io;
+use "../std/env.cst" as env;
 use "core/common.cst" as c;
 use "parser/parser.cst" as parser;
 use "exec/build.cst" as build;
@@ -7,15 +8,22 @@ use "exec/scripts.cst" as scripts;
 fn print_usage() as void {
     c.print("usage: caustic-mk <command> [args]\n\n");
     c.print("commands:\n");
-    c.print("  build <target>  build a target\n");
-    c.print("  run <name>      run script or target\n");
-    c.print("  test            run 'test' script\n");
-    c.print("  clean           remove .caustic/ and build/\n");
-    c.print("  init            create a new Causticfile\n");
+    c.print("  build <target>      build a target\n");
+    c.print("  run <name> [args]   run script or target (args become $1..$n / argv)\n");
+    c.print("  test [args]         run 'test' script\n");
+    c.print("  clean               remove .caustic/ and build/\n");
+    c.print("  init                create a new Causticfile\n\n");
+    c.print("build flags:\n");
+    c.print("  --incremental   separate compilation, reuse unchanged objects\n");
+    c.print("  --continue      keep going when a dependency target fails\n");
 }
 
 fn main(argc as i64, argv as i64) as i32 {
     let is *i64 as argv_arr = cast(*i64, argv);
+    // Publishes argc/argv/envp to std/env. Without this envp() is null and
+    // every command we spawn inherits an EMPTY environment — no PATH from the
+    // caller, no $CAUSTIC_DIR, no $HOME — because execve gets a null envp.
+    env.init(argc, cast(*u8, argv));
 
     if (argc < 2) {
         print_usage();
@@ -69,15 +77,26 @@ fn main(argc as i64, argv as i64) as i32 {
     if (c.streq_lit(cmd, "run") == 1) {
         if (argc < 3) {
             c.eprint("error: no name specified\n");
-            c.eprint("usage: caustic-mk run <name>\n");
+            c.eprint("usage: caustic-mk run <name> [args...]\n");
             return 1;
         }
         let is *u8 as name = cast(*u8, argv_arr[2]);
-        return scripts.exec_run(&proj, name);
+        // Everything after the name is forwarded: a script sees it as its
+        // positional parameters ($1..$n, $@), a target as its own argv.
+        // A leading "--" is dropped so flags can't be mistaken for ours.
+        let is i64 as first with mut = 3;
+        if (argc > 3 && c.streq_lit(cast(*u8, argv_arr[3]), "--") == 1) { first = 4; }
+        return scripts.exec_run(&proj, name,
+                                cast(*i64, cast(i64, argv) + first * 8),
+                                argc - first);
     }
 
     if (c.streq_lit(cmd, "test") == 1) {
-        return scripts.exec_test(&proj);
+        let is i64 as first with mut = 2;
+        if (argc > 2 && c.streq_lit(cast(*u8, argv_arr[2]), "--") == 1) { first = 3; }
+        return scripts.exec_test(&proj,
+                                 cast(*i64, cast(i64, argv) + first * 8),
+                                 argc - first);
     }
 
     c.eprint("error: unknown command '");

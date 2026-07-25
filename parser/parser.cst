@@ -2,11 +2,43 @@ use "../../std/io.cst" as io;
 use "../core/common.cst" as c;
 use "cfile_lexer.cst" as lx;
 
-// Max counts
-let is i32 as MAX_TARGETS with imut = 32;
-let is i32 as MAX_DEPS with imut = 32;
-let is i32 as MAX_SCRIPTS with imut = 16;
-let is i32 as MAX_CMDS with imut = 32;
+// Table growth step. Nothing in a Causticfile has a declared ceiling any more:
+// the target / dep / script tables (and each script's command list) are page-
+// allocated through c.big_* and double on demand, so 75 targets — or 750 —
+// parse the same way. The old fixed MAX_TARGETS=32 / MAX_SCRIPTS=16 /
+// MAX_CMDS=32 arrays hard-exited with "too many targets" instead, which made
+// a large Causticfile unbuildable rather than slow.
+let is i32 as INITIAL_CAP with imut = 16;
+
+// Kinds of extra link input a target can declare beyond its main `src`.
+let is i32 as IN_SRC with imut = 1;   // extra .cst — compiled with --module-only
+let is i32 as IN_ASM with imut = 2;   // hand-written .s — assembled with caustic-as
+let is i32 as IN_OBJ with imut = 3;   // prebuilt .o — linked as-is
+
+struct Input {
+    kind as i32;
+    path_ptr as *u8;
+    path_len as i32;
+    next as *u8;
+}
+
+// A bare (ptr,len) name in a list — used for `depends`, which is repeatable.
+struct Name {
+    ptr as *u8;
+    len as i32;
+    next as *u8;
+}
+
+// One `env "K" "V"` / `env_default "K" "V"` declaration. is_default = 1 means
+// "only if the inherited environment doesn't already have it".
+struct EnvVar {
+    key_ptr as *u8;
+    key_len as i32;
+    val_ptr as *u8;
+    val_len as i32;
+    is_default as i32;
+    next as *u8;
+}
 
 struct Target {
     name_ptr as *u8;
@@ -15,17 +47,24 @@ struct Target {
     src_len as i32;
     out_ptr as *u8;
     out_len as i32;
-    flags_ptr as *u8;
+    flags_ptr as *u8;         // compiler flags
     flags_len as i32;
-    depends_ptr as *u8;
-    depends_len as i32;
+    ldflags_ptr as *u8;       // caustic-ld flags (--strip, --entry=, --base=, …)
+    ldflags_len as i32;
+    asflags_ptr as *u8;       // caustic-as flags
+    asflags_len as i32;
     has_out as i32;
-    deps as *u8;
-    mode_ptr as *u8;        // CSE --mode= value (pure|compat|bundle), or null
+    deps as *u8;              // git `depend` list (*Dep)
+    mode_ptr as *u8;          // CSE --mode= value (pure|compat|bundle), or null
     mode_len as i32;
-    extension_ptr as *u8;   // CSE --extension= value (cse|exe|com), or null
+    extension_ptr as *u8;     // CSE --extension= value (cse|exe|com), or null
     extension_len as i32;
     allow_unsupported as i32; // 1 → pass --allow-unsupported (build despite unsupported ops)
+    inputs as *u8;            // extra link inputs, in declaration order (*Input)
+    input_count as i32;
+    depends as *u8;           // other targets to build first (*Name), repeatable
+    env as *u8;               // per-target env declarations (*EnvVar)
+    visiting as i32;          // build-time cycle marker (see exec_build)
 }
 
 struct Dep {
@@ -48,6 +87,8 @@ struct Script {
     name_len as i32;
     cmds as *u8;
     cmd_count as i32;
+    cmd_cap as i32;
+    env as *u8;               // per-script env declarations (*EnvVar)
 }
 
 struct Project {
@@ -61,17 +102,51 @@ struct Project {
     license_len as i32;
     targets as *u8;
     target_count as i32;
+    target_cap as i32;
     deps as *u8;
     dep_count as i32;
+    dep_cap as i32;
     scripts as *u8;
     script_count as i32;
+    script_cap as i32;
+    env as *u8;               // project-wide env declarations (*EnvVar)
 }
 
 // System libraries (top-level `system "lib"` declarations). Read by deps.cst /
-// build.cst when assembling the compile command's -l flags.
-let is [16]i64 as system_lib_ptrs with mut;
-let is [16]i32 as system_lib_lens with mut;
+// build.cst when assembling the compile command's -l flags. Growable: the old
+// [16] arrays dropped entries past the 16th without a word.
+let is *u8 as _sys_lib_ptrs with mut;      // *i64 array
+let is *u8 as _sys_lib_lens with mut;      // *i32 array
 let is i32 as system_lib_count with mut = 0;
+let is i32 as _sys_lib_cap with mut = 0;
+
+fn _grow_system_libs() as void {
+    if (system_lib_count < _sys_lib_cap) { return; }
+    let is i32 as newcap with mut = _sys_lib_cap * 2;
+    if (newcap < INITIAL_CAP) { newcap = INITIAL_CAP; }
+    _sys_lib_ptrs = c.big_grow(_sys_lib_ptrs, cast(i64, _sys_lib_cap) * 8, cast(i64, newcap) * 8);
+    _sys_lib_lens = c.big_grow(_sys_lib_lens, cast(i64, _sys_lib_cap) * 4, cast(i64, newcap) * 4);
+    _sys_lib_cap = newcap;
+}
+
+fn add_system_lib(ptr as *u8, len as i32) as void {
+    _grow_system_libs();
+    let is *i64 as ptrs = cast(*i64, _sys_lib_ptrs);
+    let is *i32 as lens = cast(*i32, _sys_lib_lens);
+    ptrs[system_lib_count] = cast(i64, ptr);
+    lens[system_lib_count] = len;
+    system_lib_count = system_lib_count + 1;
+}
+
+fn system_lib_ptr(idx as i32) as *u8 {
+    let is *i64 as ptrs = cast(*i64, _sys_lib_ptrs);
+    return cast(*u8, ptrs[idx]);
+}
+
+fn system_lib_len(idx as i32) as i32 {
+    let is *i32 as lens = cast(*i32, _sys_lib_lens);
+    return lens[idx];
+}
 
 // === Accessors (safe struct indexing into the parallel arrays) ===
 
@@ -91,6 +166,67 @@ fn get_script_cmd(scr as *Script, idx as i32) as *ScriptCmd {
     return cast(*ScriptCmd, cast(i64, scr.cmds) + cast(i64, idx) * sizeof(ScriptCmd));
 }
 
+// === List helpers ===
+// Append-at-tail by walking the list. The lists are a handful of entries long
+// and only built at parse time, so the walk costs nothing and this avoids
+// carrying a tail pointer in every owner struct. Order matters: link inputs are
+// handed to caustic-ld in declaration order, env vars are applied in order.
+
+fn _link_input(head as *u8, node as *Input) as *u8 {
+    if (cast(i64, head) == 0) { return cast(*u8, node); }
+    let is *Input as p with mut = cast(*Input, head);
+    while (cast(i64, p.next) != 0) { p = cast(*Input, p.next); }
+    p.next = cast(*u8, node);
+    return head;
+}
+
+fn _link_name(head as *u8, node as *Name) as *u8 {
+    if (cast(i64, head) == 0) { return cast(*u8, node); }
+    let is *Name as p with mut = cast(*Name, head);
+    while (cast(i64, p.next) != 0) { p = cast(*Name, p.next); }
+    p.next = cast(*u8, node);
+    return head;
+}
+
+fn _link_env(head as *u8, node as *EnvVar) as *u8 {
+    if (cast(i64, head) == 0) { return cast(*u8, node); }
+    let is *EnvVar as p with mut = cast(*EnvVar, head);
+    while (cast(i64, p.next) != 0) { p = cast(*EnvVar, p.next); }
+    p.next = cast(*u8, node);
+    return head;
+}
+
+fn _new_input(kind as i32, tok as *lx.Token) as *Input {
+    let is *Input as n = cast(*Input, c.galloc(sizeof(Input)));
+    n.kind = kind;
+    n.path_ptr = tok.ptr;
+    n.path_len = tok.len;
+    n.next = cast(*u8, 0);
+    return n;
+}
+
+fn _new_name(tok as *lx.Token) as *Name {
+    let is *Name as n = cast(*Name, c.galloc(sizeof(Name)));
+    n.ptr = tok.ptr;
+    n.len = tok.len;
+    n.next = cast(*u8, 0);
+    return n;
+}
+
+// Parse the value pair of an `env` / `env_default` declaration.
+fn _new_env(is_default as i32) as *EnvVar {
+    let is lx.Token as key = lx.expect_string("env name");
+    let is lx.Token as val = lx.expect_string("env value");
+    let is *EnvVar as e = cast(*EnvVar, c.galloc(sizeof(EnvVar)));
+    e.key_ptr = key.ptr;
+    e.key_len = key.len;
+    e.val_ptr = val.ptr;
+    e.val_len = val.len;
+    e.is_default = is_default;
+    e.next = cast(*u8, 0);
+    return e;
+}
+
 // === Target parsing ===
 
 fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
@@ -102,8 +238,10 @@ fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
     t.out_len = 0;
     t.flags_ptr = cast(*u8, 0);
     t.flags_len = 0;
-    t.depends_ptr = cast(*u8, 0);
-    t.depends_len = 0;
+    t.ldflags_ptr = cast(*u8, 0);
+    t.ldflags_len = 0;
+    t.asflags_ptr = cast(*u8, 0);
+    t.asflags_len = 0;
     t.has_out = 0;
     t.deps = cast(*u8, 0);
     t.mode_ptr = cast(*u8, 0);
@@ -111,6 +249,11 @@ fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
     t.extension_ptr = cast(*u8, 0);
     t.extension_len = 0;
     t.allow_unsupported = 0;
+    t.inputs = cast(*u8, 0);
+    t.input_count = 0;
+    t.depends = cast(*u8, 0);
+    t.env = cast(*u8, 0);
+    t.visiting = 0;
 }
 
 // Parse `depend "name" in "url" [tag "version"]` and prepend it to t.deps.
@@ -146,16 +289,24 @@ fn _parse_target_depends(t as *Target) as void {
     t.deps = cast(*u8, dep);
 }
 
+fn _grow_targets(proj as *Project) as void {
+    if (proj.target_count < proj.target_cap) { return; }
+    let is i32 as newcap with mut = proj.target_cap * 2;
+    if (newcap < INITIAL_CAP) { newcap = INITIAL_CAP; }
+    proj.targets = c.big_grow(proj.targets,
+                              cast(i64, proj.target_cap) * sizeof(Target),
+                              cast(i64, newcap) * sizeof(Target));
+    proj.target_cap = newcap;
+}
+
 fn parse_target(proj as *Project) as void {
     let is lx.Token as name_tok = lx.expect_string("target name");
     lx.expect_lbrace();
 
+    // Grow BEFORE taking the element pointer: big_grow moves the table, so a
+    // *Target obtained earlier would dangle.
+    _grow_targets(proj);
     let is i32 as idx = proj.target_count;
-    if (idx >= MAX_TARGETS) {
-        c.eprint("error: too many targets");
-        c.write_nl(2);
-        io.exit(1);
-    }
     let is *Target as t = get_target(proj, idx);
     _init_target_defaults(t, &name_tok);
     proj.target_count = idx + 1;
@@ -176,6 +327,32 @@ fn parse_target(proj as *Project) as void {
             let is lx.Token as val = lx.expect_string("flags");
             t.flags_ptr = val.ptr;
             t.flags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "ldflags") == 1) {
+            // Flags for the LINK step. caustic-ld accepts several the compiler
+            // rejects outright (--strip, --map, --keep-empty), so a target that
+            // needs them has to go through the staged pipeline.
+            let is lx.Token as val = lx.expect_string("ldflags");
+            t.ldflags_ptr = val.ptr;
+            t.ldflags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "asflags") == 1) {
+            let is lx.Token as val = lx.expect_string("asflags");
+            t.asflags_ptr = val.ptr;
+            t.asflags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "source") == 1) {
+            // Extra Caustic module, compiled --module-only and linked in.
+            let is lx.Token as val = lx.expect_string("source");
+            t.inputs = _link_input(t.inputs, _new_input(IN_SRC, &val));
+            t.input_count = t.input_count + 1;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "asm") == 1) {
+            // Hand-written assembly, run through caustic-as (-> <path>.o).
+            let is lx.Token as val = lx.expect_string("asm");
+            t.inputs = _link_input(t.inputs, _new_input(IN_ASM, &val));
+            t.input_count = t.input_count + 1;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "obj") == 1) {
+            // Already-built object, linked as-is.
+            let is lx.Token as val = lx.expect_string("obj");
+            t.inputs = _link_input(t.inputs, _new_input(IN_OBJ, &val));
+            t.input_count = t.input_count + 1;
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "mode") == 1) {
             // CSE output mode (only used with --target=caustic-x86_64)
             let is lx.Token as val = lx.expect_string("mode");
@@ -188,46 +365,85 @@ fn parse_target(proj as *Project) as void {
             t.extension_len = val.len;
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "allow_unsupported") == 1) {
             // Build even if the program uses ops a target doesn't implement.
-            let is lx.Token as val = lx.expect_string("allow_unsupported");
+            let is lx.Token as _val = lx.expect_string("allow_unsupported");
             t.allow_unsupported = 1;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env") == 1) {
+            t.env = _link_env(t.env, _new_env(0));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env_default") == 1) {
+            t.env = _link_env(t.env, _new_env(1));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "depends") == 1) {
+            // Repeatable: every named target is built (in order) first.
             let is lx.Token as val = lx.expect_string("depends");
-            t.depends_ptr = val.ptr;
-            t.depends_len = val.len;
+            t.depends = _link_name(t.depends, _new_name(&val));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "depend") == 1) {
             _parse_target_depends(t);
+        } else if (tok.kind == lx.TK_IDENT) {
+            c.eprint("error: unknown target key '");
+            io._write_fd(2, tok.ptr, cast(i64, tok.len));
+            c.eprint("' in target '");
+            io._write_fd(2, t.name_ptr, cast(i64, t.name_len));
+            c.eprint("'");
+            c.write_nl(2);
+            io.exit(1);
         }
         tok = lx.next_token();
     }
+}
+
+fn _grow_scripts(proj as *Project) as void {
+    if (proj.script_count < proj.script_cap) { return; }
+    let is i32 as newcap with mut = proj.script_cap * 2;
+    if (newcap < INITIAL_CAP) { newcap = INITIAL_CAP; }
+    proj.scripts = c.big_grow(proj.scripts,
+                              cast(i64, proj.script_cap) * sizeof(Script),
+                              cast(i64, newcap) * sizeof(Script));
+    proj.script_cap = newcap;
+}
+
+fn _grow_cmds(s as *Script) as void {
+    if (s.cmd_count < s.cmd_cap) { return; }
+    let is i32 as newcap with mut = s.cmd_cap * 2;
+    if (newcap < INITIAL_CAP) { newcap = INITIAL_CAP; }
+    s.cmds = c.big_grow(s.cmds,
+                        cast(i64, s.cmd_cap) * sizeof(ScriptCmd),
+                        cast(i64, newcap) * sizeof(ScriptCmd));
+    s.cmd_cap = newcap;
 }
 
 fn parse_script(proj as *Project) as void {
     let is lx.Token as name_tok = lx.expect_string("script name");
     lx.expect_lbrace();
 
+    _grow_scripts(proj);
     let is i32 as idx = proj.script_count;
-    if (idx >= MAX_SCRIPTS) {
-        c.eprint("error: too many scripts");
-        c.write_nl(2);
-        io.exit(1);
-    }
     let is *Script as s = get_script(proj, idx);
     s.name_ptr = name_tok.ptr;
     s.name_len = name_tok.len;
-    s.cmds = c.galloc(cast(i64, MAX_CMDS) * sizeof(ScriptCmd));
+    s.cmds = cast(*u8, 0);
     s.cmd_count = 0;
+    s.cmd_cap = 0;
+    s.env = cast(*u8, 0);
     proj.script_count = idx + 1;
 
     let is lx.Token as tok with mut;
     tok = lx.next_token();
     while (tok.kind != lx.TK_RBRACE && tok.kind != lx.TK_EOF) {
         if (tok.kind == lx.TK_STRING) {
-            if (s.cmd_count < MAX_CMDS) {
-                let is *ScriptCmd as cmd = get_script_cmd(s, s.cmd_count);
-                cmd.ptr = tok.ptr;
-                cmd.len = tok.len;
-                s.cmd_count = s.cmd_count + 1;
-            }
+            _grow_cmds(s);
+            let is *ScriptCmd as cmd = get_script_cmd(s, s.cmd_count);
+            cmd.ptr = tok.ptr;
+            cmd.len = tok.len;
+            s.cmd_count = s.cmd_count + 1;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env") == 1) {
+            s.env = _link_env(s.env, _new_env(0));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env_default") == 1) {
+            s.env = _link_env(s.env, _new_env(1));
+        } else if (tok.kind == lx.TK_IDENT) {
+            c.eprint("error: unknown script key '");
+            io._write_fd(2, tok.ptr, cast(i64, tok.len));
+            c.eprint("'");
+            c.write_nl(2);
+            io.exit(1);
         }
         tok = lx.next_token();
     }
@@ -246,12 +462,16 @@ fn parse(src as *u8, src_len as i64) as Project {
     proj.author_len = 0;
     proj.license_ptr = cast(*u8, 0);
     proj.license_len = 0;
-    proj.targets = c.galloc(cast(i64, MAX_TARGETS) * sizeof(Target));
+    proj.targets = cast(*u8, 0);
     proj.target_count = 0;
-    proj.deps = c.galloc(cast(i64, MAX_DEPS) * sizeof(Dep));
+    proj.target_cap = 0;
+    proj.deps = cast(*u8, 0);
     proj.dep_count = 0;
-    proj.scripts = c.galloc(cast(i64, MAX_SCRIPTS) * sizeof(Script));
+    proj.dep_cap = 0;
+    proj.scripts = cast(*u8, 0);
     proj.script_count = 0;
+    proj.script_cap = 0;
+    proj.env = cast(*u8, 0);
 
     let is lx.Token as tok with mut;
     tok = lx.next_token();
@@ -276,11 +496,12 @@ fn parse(src as *u8, src_len as i64) as Project {
             parse_target(&proj);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "system") == 1) {
             let is lx.Token as val = lx.expect_string("system lib");
-            if (system_lib_count < 16) {
-                system_lib_ptrs[system_lib_count] = cast(i64, val.ptr);
-                system_lib_lens[system_lib_count] = val.len;
-                system_lib_count = system_lib_count + 1;
-            }
+            add_system_lib(val.ptr, val.len);
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env") == 1) {
+            // Project-wide: applies to every script command AND every build step.
+            proj.env = _link_env(proj.env, _new_env(0));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env_default") == 1) {
+            proj.env = _link_env(proj.env, _new_env(1));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "script") == 1) {
             parse_script(&proj);
         } else {

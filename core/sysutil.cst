@@ -1,6 +1,6 @@
 use "../../std/io.cst" as io;
-use "../../std/mem.cst" as mem;
 use "../../std/os.cst" as os;
+use "../../std/env.cst" as env;
 use "../../std/process.cst" as proc;
 use "common.cst" as c;
 use "../parser/parser.cst" as parser;
@@ -12,39 +12,202 @@ let is *u8 as TAG_SUFFIX with imut = "/.caustic-tag";
 
 // === Subprocess ===
 
+// Environment prologue for a command. Declared `env` / `env_default` entries
+// are prepended to the command text as shell assignments rather than handed to
+// execve, so one code path covers /bin/sh and cmd.exe and the variables are
+// visible both to the command itself and to anything it spawns.
+//
+// `env_default` keeps an inherited value when there is one — that is the
+// `${VAR:-fallback}` idiom the hand-written build scripts use, e.g.
+// `env_default "CAUSTIC_DIR" "../Caustic"`.
+fn _env_prologue(head as *parser.EnvVar, is_windows as i32) as *u8 {
+    let is *u8 as out with mut = c.str_dup("", 0);
+    let is *parser.EnvVar as e with mut = head;
+    while (cast(i64, e) != 0) {
+        let is *u8 as k = c.str_dup(e.key_ptr, e.key_len);
+        if (is_windows == 1) {
+            let is *u8 as v = c.str_dup(e.val_ptr, e.val_len);
+            // Parenthesised so the `&` chain isn't swallowed by `if`'s body.
+            if (e.is_default == 1) {
+                out = c.str_cat3(out, "(if not defined ", k);
+                out = c.str_cat(out, " set \"");
+            } else {
+                out = c.str_cat(out, "(set \"");
+            }
+            out = c.str_cat(out, c.str_cat3(k, "=", v));
+            out = c.str_cat(out, "\") & ");
+        } else {
+            let is *u8 as v = c.sh_quote_n(e.val_ptr, e.val_len);
+            if (e.is_default == 1) {
+                out = c.str_cat(out, c.str_cat3("if [ -z \"${", k, ":-}\" ]; then "));
+            }
+            out = c.str_cat(out, c.str_cat3(k, "=", v));
+            out = c.str_cat(out, c.str_cat3("; export ", k, "; "));
+            if (e.is_default == 1) { out = c.str_cat(out, "fi; "); }
+        }
+        e = cast(*parser.EnvVar, e.next);
+    }
+    return out;
+}
+
+fn _is_var_char(ch as u8) as i32 {
+    if (ch >= 97 && ch <= 122) { return 1; }   // a-z
+    if (ch >= 65 && ch <= 90) { return 1; }    // A-Z
+    if (ch >= 48 && ch <= 57) { return 1; }    // 0-9
+    if (ch == 95) { return 1; }                // _
+    return 0;
+}
+
+// Value of $NAME: a declared `env` entry (narrower scope wins), else the
+// inherited environment, else empty — the same precedence sh applies.
+fn _var_value(name as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar) as *u8 {
+    let is i32 as pass with mut = 0;
+    while (pass < 2) {
+        let is *parser.EnvVar as e with mut = env2;
+        if (pass == 1) { e = env1; }
+        while (cast(i64, e) != 0) {
+            if (c.streq(e.key_ptr, e.key_len, name) == 1) {
+                return c.str_dup(e.val_ptr, e.val_len);
+            }
+            e = cast(*parser.EnvVar, e.next);
+        }
+        pass = pass + 1;
+    }
+    let is *u8 as inherited = env.getenv(name);
+    if (cast(i64, inherited) != 0) { return inherited; }
+    return c.str_dup("", 0);
+}
+
+// Windows-only textual expansion of $1..$9 / $@ / $* / $NAME / ${NAME}.
+//
+// On Linux none of this is needed: the arguments are passed to /bin/sh as real
+// positional parameters and sh expands $VAR itself, so `$1`, `$@`, `$#` behave
+// exactly as in a shell script and an awk `$1` inside single quotes is left
+// alone. cmd.exe has neither — and it expands %VAR% *before* running the line,
+// so a variable `set` by the same command line reads back empty. Expanding here
+// is what lets one Causticfile use `$VAR` syntax on both platforms.
+fn _expand_win(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
+               args as *i64, argc as i64) as *u8 {
+    let is i64 as len = c.strlen(cmd);
+    let is *u8 as out with mut = c.str_dup("", 0);
+    let is i64 as i with mut = 0;
+    let is i64 as seg with mut = 0;
+    while (i < len) {
+        if (cmd[i] != 36) { i = i + 1; }        // not '$'
+        else {
+            let is i64 as after with mut = 0;   // 0 = not a substitution
+            let is *u8 as rep with mut = cast(*u8, 0);
+            if (i + 1 < len) {
+                let is u8 as nx = cmd[i + 1];
+                if (nx >= 49 && nx <= 57) {                  // $1..$9
+                    let is i64 as ai = cast(i64, nx) - 49;
+                    rep = c.str_dup("", 0);
+                    if (ai < argc) { rep = cast(*u8, args[ai]); }
+                    after = i + 2;
+                } else if (nx == 64 || nx == 42) {           // $@ / $*
+                    rep = c.str_dup("", 0);
+                    let is i64 as ai with mut = 0;
+                    while (ai < argc) {
+                        if (ai > 0) { rep = c.str_cat(rep, " "); }
+                        rep = c.str_cat(rep, cast(*u8, args[ai]));
+                        ai = ai + 1;
+                    }
+                    after = i + 2;
+                } else if (nx == 123) {                      // ${NAME}
+                    let is i64 as e with mut = i + 2;
+                    while (e < len && cmd[e] != 125) { e = e + 1; }
+                    if (e < len) {
+                        let is *u8 as nm = c.str_dup(cast(*u8, cast(i64, cmd) + i + 2), cast(i32, e - i - 2));
+                        rep = _var_value(nm, env1, env2);
+                        after = e + 1;
+                    }
+                } else if (_is_var_char(nx) == 1) {          // $NAME
+                    let is i64 as e with mut = i + 1;
+                    while (e < len && _is_var_char(cmd[e]) == 1) { e = e + 1; }
+                    let is *u8 as nm = c.str_dup(cast(*u8, cast(i64, cmd) + i + 1), cast(i32, e - i - 1));
+                    rep = _var_value(nm, env1, env2);
+                    after = e;
+                }
+            }
+            if (after == 0) {
+                i = i + 1;
+            } else {
+                out = c.str_cat(out, c.str_dup(cast(*u8, cast(i64, cmd) + seg), cast(i32, i - seg)));
+                out = c.str_cat(out, rep);
+                i = after;
+                seg = i;
+            }
+        }
+    }
+    if (seg < len) {
+        out = c.str_cat(out, c.str_dup(cast(*u8, cast(i64, cmd) + seg), cast(i32, len - seg)));
+    }
+    return out;
+}
+
 // Run a shell command (Linux: /bin/sh -c "cmd"; Windows: cmd.exe /c "cmd")
 // and return its exit code. Uses std/process facade for cross-platform.
-fn run_cmd(cmd as *u8) as i32 {
+//
+// env1/env2 are optional *parser.EnvVar lists applied in that order (project
+// then target/script, so the narrower scope wins). args/argc are the extra
+// arguments from `caustic-mk run <script> -- <args>`; on Linux they become the
+// shell's positional parameters.
+fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
+               args as *i64, argc as i64) as i32 {
     c.print("  > ");
     c.print(cmd);
+    if (argc > 0) {
+        // Bracketed: these are the shell's positional parameters, not text
+        // appended to the command.
+        c.print("   [args:");
+        let is i64 as ai with mut = 0;
+        while (ai < argc) {
+            c.print(" ");
+            c.print(cast(*u8, args[ai]));
+            ai = ai + 1;
+        }
+        c.print("]");
+    }
     c.write_nl(1);
 
     if (os.current() == os.OS_LINUX) {
-        let is [4]i64 as argv;
-        argv[0] = cast(i64, "/bin/sh");
-        argv[1] = cast(i64, "-c");
-        argv[2] = cast(i64, cmd);
-        argv[3] = 0;
-        let is i64 as pid = proc.spawn("/bin/sh", cast(*u8, &argv));
+        let is *u8 as full with mut = c.str_cat(_env_prologue(env1, 0), _env_prologue(env2, 0));
+        full = c.str_cat(full, cmd);
+        // argv: sh -c <cmd> <$0> <$1..$n> NULL
+        let is *i64 as sargv = cast(*i64, c.galloc((argc + 5) * 8));
+        sargv[0] = cast(i64, "/bin/sh");
+        sargv[1] = cast(i64, "-c");
+        sargv[2] = cast(i64, full);
+        sargv[3] = cast(i64, "caustic-mk");
+        let is i64 as i with mut = 0;
+        while (i < argc) { sargv[4 + i] = args[i]; i = i + 1; }
+        sargv[4 + argc] = 0;
+        let is i64 as pid = proc.spawn("/bin/sh", cast(*u8, sargv));
         if (pid < 0) { c.eprint("error: spawn failed\n"); return 1; }
         return proc.wait_pid(pid);
     }
     if (os.current() == os.OS_WINDOWS) {
         // CreateProcessA accepts a single command-line string. We pass the
         // whole "cmd.exe /c <cmd>" as the path (lpApplicationName=NULL).
-        let is i64 as cmd_len = c.strlen(cmd);
-        let is *u8 as full = c.galloc(cmd_len + 16);
-        let is *u8 as prefix = "cmd.exe /c ";
-        let is i64 as p_len = c.strlen(prefix);
-        mem.memcpy(full, prefix, p_len);
-        mem.memcpy(cast(*u8, cast(i64, full) + p_len), cmd, cmd_len);
-        full[p_len + cmd_len] = 0;
+        let is *u8 as body = _expand_win(cmd, env1, env2, args, argc);
+        let is *u8 as full with mut = c.str_cat("cmd.exe /c ", _env_prologue(env1, 1));
+        full = c.str_cat3(full, _env_prologue(env2, 1), body);
         let is i64 as h = proc.spawn(full, cast(*u8, 0));
-        c.gfree(full);
         if (h == 0 - 1) { c.eprint("error: spawn failed\n"); return 1; }
         return proc.wait_pid(h);
     }
     return 1;
+}
+
+fn run_cmd(cmd as *u8) as i32 {
+    return run_cmd_env(cmd, cast(*parser.EnvVar, 0), cast(*parser.EnvVar, 0), cast(*i64, 0), 0);
+}
+
+// Quote one argument for the platform's shell, so a path with spaces survives
+// being spliced into a command line.
+fn quote_arg(s as *u8) as *u8 {
+    if (os.current() == os.OS_WINDOWS) { return c.str_cat3("\"", s, "\""); }
+    return c.sh_quote(s);
 }
 
 // === Filesystem ===

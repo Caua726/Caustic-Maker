@@ -12,6 +12,7 @@ struct Token {
     kind as i32;
     ptr as *u8;
     len as i32;
+    start as i64;      // offset in _src where the token began
 }
 
 // Lexer state. Kept private to this module; the parser drives it through
@@ -28,9 +29,11 @@ fn lexer_init(src as *u8, src_len as i64) as void {
 }
 
 // Rewind so the next next_token() re-reads `tok` (one-token lookahead undo).
+// Uses the recorded source offset, not tok.ptr — an escaped string token points
+// at a heap copy, so pointer arithmetic against _src would be meaningless.
 fn lexer_pushback(tok as *Token) as void {
-    if (cast(i64, tok.ptr) != 0) {
-        _pos = cast(i64, tok.ptr) - cast(i64, _src);
+    if (tok.start >= 0 && tok.start <= _src_len) {
+        _pos = tok.start;
     }
 }
 
@@ -39,8 +42,11 @@ fn skip_whitespace() as void {
         let is u8 as ch = _src[_pos];
         if (ch == 32 || ch == 9 || ch == 10 || ch == 13) {
             _pos = _pos + 1;
-        } else if (ch == 47 && _pos + 1 < _src_len && _src[_pos + 1] == 47) {
-            // skip // comment
+        } else if (ch == 35 || (ch == 47 && _pos + 1 < _src_len && _src[_pos + 1] == 47)) {
+            // skip a `//` or `#` comment. `#` used to fall through to the
+            // unknown-character path, which reported TK_EOF — so a Causticfile
+            // written with `#` comments parsed only up to the first one and
+            // every target below it silently vanished.
             while (_pos < _src_len && _src[_pos] != 10) {
                 _pos = _pos + 1;
             }
@@ -62,6 +68,7 @@ fn is_ident_char(ch as u8) as i32 {
 fn next_token() as Token {
     let is Token as tok;
     skip_whitespace();
+    tok.start = _pos;
     if (_pos >= _src_len) {
         tok.kind = TK_EOF;
         tok.ptr = cast(*u8, 0);
@@ -84,18 +91,55 @@ fn next_token() as Token {
         return tok;
     }
     if (ch == 34) {
-        // string literal
+        // String literal. Backslash escapes \" \\ \n \t are honoured, so a
+        // command can contain a double quote — without them, a script command
+        // like  "sh -c \"echo hi\""  silently terminated at the first \" and
+        // the rest of the line parsed as garbage tokens.
         _pos = _pos + 1;
         let is i64 as start = _pos;
+        let is i32 as escaped with mut = 0;
         while (_pos < _src_len && _src[_pos] != 34) {
+            if (_src[_pos] == 92 && _pos + 1 < _src_len) {   // '\'
+                escaped = 1;
+                _pos = _pos + 1;
+            }
             _pos = _pos + 1;
         }
+        let is i64 as raw_len = _pos - start;
+        if (_pos >= _src_len) {
+            c.eprint("error: unterminated string in Causticfile");
+            c.write_nl(2);
+            io.exit(1);
+        }
+        _pos = _pos + 1;
         tok.kind = TK_STRING;
-        tok.ptr = cast(*u8, cast(i64, _src) + start);
-        tok.len = cast(i32, _pos - start);
-        if (_pos < _src_len) {
-            _pos = _pos + 1;
+        if (escaped == 0) {
+            // Common case: the token aliases the source buffer, no copy.
+            tok.ptr = cast(*u8, cast(i64, _src) + start);
+            tok.len = cast(i32, raw_len);
+            return tok;
         }
+        let is *u8 as buf = c.galloc(raw_len + 1);
+        let is i64 as i with mut = 0;
+        let is i64 as o with mut = 0;
+        while (i < raw_len) {
+            let is u8 as cur = _src[start + i];
+            if (cur == 92 && i + 1 < raw_len) {
+                let is u8 as nx = _src[start + i + 1];
+                if (nx == 110) { buf[o] = cast(u8, 10); }        // \n
+                else if (nx == 116) { buf[o] = cast(u8, 9); }    // \t
+                else { buf[o] = nx; }                            // \" \\ \<any>
+                o = o + 1;
+                i = i + 2;
+            } else {
+                buf[o] = cur;
+                o = o + 1;
+                i = i + 1;
+            }
+        }
+        buf[o] = cast(u8, 0);
+        tok.ptr = buf;
+        tok.len = cast(i32, o);
         return tok;
     }
     if (is_ident_char(ch) == 1) {
@@ -108,11 +152,14 @@ fn next_token() as Token {
         tok.len = cast(i32, _pos - start);
         return tok;
     }
-    // unknown char, skip
-    _pos = _pos + 1;
-    tok.kind = TK_EOF;
-    tok.ptr = cast(*u8, 0);
-    tok.len = 0;
+    // Anything else is a syntax error. It used to be reported as TK_EOF, which
+    // made the parser stop silently and ignore the rest of the file — a stray
+    // character truncated the project instead of failing it.
+    c.eprint("error: unexpected character '");
+    io._write_fd(2, cast(*u8, cast(i64, _src) + _pos), 1);
+    c.eprint("' in Causticfile");
+    c.write_nl(2);
+    io.exit(1);
     return tok;
 }
 
