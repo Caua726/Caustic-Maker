@@ -66,6 +66,39 @@ struct Target {
     env as *u8;               // per-target env declarations (*EnvVar)
     visiting as i32;          // build-time cycle marker (see exec_build)
     done as i32;              // already built in this invocation
+    // Where to write the generated VERSION module, or null for "don't".
+    // Opt-in: the maker used to drop a version.cst next to every target's
+    // source whether or not anything imported it, overwriting whatever was
+    // already there. Generating source into someone's tree is not something to
+    // do by inference.
+    version_file_ptr as *u8;
+    version_file_len as i32;
+    install_ptr as *u8;       // `install` destination, or null
+    install_len as i32;
+    before as *u8;            // scripts to run before building (*Name)
+    after as *u8;             // scripts to run after a successful build (*Name)
+    decl_off as i64;          // offset of the target name, for error messages
+}
+
+// A named set of build settings applied on top of the project defaults, chosen
+// with `--profile <name>`: the release/debug split that otherwise forces either
+// two Causticfiles or editing flags in place before each build.
+struct Profile {
+    name_ptr as *u8;
+    name_len as i32;
+    flags_ptr as *u8;
+    flags_len as i32;
+    ldflags_ptr as *u8;
+    ldflags_len as i32;
+    asflags_ptr as *u8;
+    asflags_len as i32;
+    mode_ptr as *u8;
+    mode_len as i32;
+    extension_ptr as *u8;
+    extension_len as i32;
+    out_dir_ptr as *u8;
+    out_dir_len as i32;
+    next as *u8;
 }
 
 struct Dep {
@@ -90,6 +123,7 @@ struct Script {
     cmd_count as i32;
     cmd_cap as i32;
     env as *u8;               // per-script env declarations (*EnvVar)
+    decl_off as i64;          // offset of the script name, for error messages
 }
 
 struct Project {
@@ -111,6 +145,35 @@ struct Project {
     script_count as i32;
     script_cap as i32;
     env as *u8;               // project-wide env declarations (*EnvVar)
+    // Project-wide compiler flags, prepended to every target's own `flags`.
+    // For the common case where every target in a project shares a flag — a
+    // whole tree of freestanding programs built with the same
+    // `--target=caustic-x86_64`, say — repeating it per target is the kind of
+    // duplication a manifest exists to remove. A target's own `flags` come
+    // after these, so the narrower scope still wins on any conflict, matching
+    // how `env` / `env_default` already scope.
+    flags_ptr as *u8;
+    flags_len as i32;
+    // The rest of the per-target build settings, also inheritable. `flags`
+    // alone wasn't enough: a project whose targets all emit CSE needs the same
+    // `mode`/`extension` everywhere too, and one that links freestanding needs
+    // the same `ldflags`.
+    ldflags_ptr as *u8;
+    ldflags_len as i32;
+    asflags_ptr as *u8;
+    asflags_len as i32;
+    mode_ptr as *u8;
+    mode_len as i32;
+    extension_ptr as *u8;
+    extension_len as i32;
+    allow_unsupported as i32;
+    out_dir_ptr as *u8;       // default output directory (else "build")
+    out_dir_len as i32;
+    toolchain_ptr as *u8;     // where caustic/caustic-as/caustic-ld live
+    toolchain_len as i32;
+    prefix_ptr as *u8;        // default `install` prefix
+    prefix_len as i32;
+    profiles as *u8;          // *Profile, declaration order
 }
 
 // System libraries (top-level `system "lib"` declarations). Read by deps.cst /
@@ -131,6 +194,14 @@ fn _grow_system_libs() as void {
 }
 
 fn add_system_lib(ptr as *u8, len as i32) as void {
+    // Ignore a repeat. A dependency's Causticfile is re-scanned once per target
+    // that names it, so `build all` over N targets sharing one dep used to hand
+    // the linker `-lfoo` N times.
+    let is i32 as i with mut = 0;
+    while (i < system_lib_count) {
+        if (c.streq_n(ptr, cast(i64, len), system_lib_ptr(i), system_lib_len(i)) == 1) { return; }
+        i = i + 1;
+    }
     _grow_system_libs();
     let is *i64 as ptrs = cast(*i64, _sys_lib_ptrs);
     let is *i32 as lens = cast(*i32, _sys_lib_lens);
@@ -155,9 +226,9 @@ fn get_target(proj as *Project, idx as i32) as *Target {
     return cast(*Target, cast(i64, proj.targets) + cast(i64, idx) * sizeof(Target));
 }
 
-fn get_dep(proj as *Project, idx as i32) as *Dep {
-    return cast(*Dep, cast(i64, proj.deps) + cast(i64, idx) * sizeof(Dep));
-}
+// (There is no get_dep: proj.deps is a *Dep LIST, walked via .next, not a table
+// indexed like targets/scripts. The indexing accessor this file used to carry
+// was never called — and would have been wrong if it had been.)
 
 fn get_script(proj as *Project, idx as i32) as *Script {
     return cast(*Script, cast(i64, proj.scripts) + cast(i64, idx) * sizeof(Script));
@@ -197,11 +268,11 @@ fn _link_env(head as *u8, node as *EnvVar) as *u8 {
     return head;
 }
 
-fn _new_input(kind as i32, tok as *lx.Token) as *Input {
+fn _new_input_path(kind as i32, path as *u8) as *Input {
     let is *Input as n = cast(*Input, c.galloc(sizeof(Input)));
     n.kind = kind;
-    n.path_ptr = tok.ptr;
-    n.path_len = tok.len;
+    n.path_ptr = path;
+    n.path_len = cast(i32, c.strlen(path));
     n.next = cast(*u8, 0);
     return n;
 }
@@ -214,9 +285,51 @@ fn _new_name(tok as *lx.Token) as *Name {
     return n;
 }
 
+// === Include support ===
+// Paths inside an included Causticfile are written relative to THAT file, so
+// every path-valued key gets the includer's directory prefixed. Set while an
+// include is being parsed, empty otherwise.
+let is *u8 as _path_prefix with mut;
+
+fn _prefix() as *u8 {
+    if (cast(i64, _path_prefix) == 0) { return ""; }
+    return _path_prefix;
+}
+
+// A path-valued token, resolved against the current include prefix, as a
+// null-terminated heap string.
+fn _path_of(tok as *lx.Token) as *u8 {
+    let is *u8 as raw = c.str_dup(tok.ptr, tok.len);
+    if (c.strlen(_prefix()) == 0) { return raw; }
+    if (raw[0] == 47) { return raw; }               // absolute: leave alone
+    return c.path_join(_prefix(), raw);
+}
+
+// A shell variable name has to be a name: `env "MY-VAR" "x"` would expand to
+// `MY-VAR='x'; export MY-VAR;`, which /bin/sh rejects with its own error from
+// inside the child — the failure looked like the command's, not the file's.
+fn _check_env_key(tok as *lx.Token) as void {
+    if (tok.len == 0) { lx.error_at(tok.start, "empty environment variable name"); }
+    let is i32 as i with mut = 0;
+    while (i < tok.len) {
+        let is u8 as ch = tok.ptr[i];
+        let is i32 as ok with mut = 0;
+        if (ch >= 97 && ch <= 122) { ok = 1; }
+        if (ch >= 65 && ch <= 90) { ok = 1; }
+        if (ch == 95) { ok = 1; }
+        if (i > 0 && ch >= 48 && ch <= 57) { ok = 1; }
+        if (ok == 0) {
+            lx.error_at_tok(tok.start, "'", tok.ptr, tok.len,
+                            "' is not a usable environment variable name (letters, digits and _ only, not starting with a digit)");
+        }
+        i = i + 1;
+    }
+}
+
 // Parse the value pair of an `env` / `env_default` declaration.
 fn _new_env(is_default as i32) as *EnvVar {
     let is lx.Token as key = lx.expect_string("env name");
+    _check_env_key(&key);
     let is lx.Token as val = lx.expect_string("env value");
     let is *EnvVar as e = cast(*EnvVar, c.galloc(sizeof(EnvVar)));
     e.key_ptr = key.ptr;
@@ -256,10 +369,56 @@ fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
     t.env = cast(*u8, 0);
     t.visiting = 0;
     t.done = 0;
+    t.version_file_ptr = cast(*u8, 0);
+    t.version_file_len = 0;
+    t.install_ptr = cast(*u8, 0);
+    t.install_len = 0;
+    t.before = cast(*u8, 0);
+    t.after = cast(*u8, 0);
+    t.decl_off = name_tok.start;
+}
+
+// Add one link input, expanding a wildcard into its matches. `asm "kernel/*.s"`
+// is how a hand-written script says it; spelling out every file by hand is both
+// noise and a thing to forget when a new one lands. Matches arrive sorted, so
+// the link order stays the same on every machine.
+fn _add_inputs(t as *Target, kind as i32, tok as *lx.Token) as void {
+    let is *u8 as pat = _path_of(tok);
+    if (c.has_glob(pat) == 0) {
+        t.inputs = _link_input(t.inputs, _new_input_path(kind, pat));
+        t.input_count = t.input_count + 1;
+        return;
+    }
+    let is i32 as n = c.glob_expand(pat);
+    if (n == 0) {
+        lx.error_at_tok(tok.start, "no file matches '", tok.ptr, tok.len, "'");
+    }
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        t.inputs = _link_input(t.inputs, _new_input_path(kind, c.glob_get(i)));
+        t.input_count = t.input_count + 1;
+        i = i + 1;
+    }
+}
+
+// A `depend` declared at the top level: shared by every target in the project,
+// instead of repeated inside each one.
+fn _parse_project_depend(proj as *Project) as void {
+    let is *Dep as dep = _parse_depend();
+    dep.next = proj.deps;
+    proj.deps = cast(*u8, dep);
+    proj.dep_count = proj.dep_count + 1;
 }
 
 // Parse `depend "name" in "url" [tag "version"]` and prepend it to t.deps.
 fn _parse_target_depends(t as *Target) as void {
+    let is *Dep as dep = _parse_depend();
+    dep.next = t.deps;
+    t.deps = cast(*u8, dep);
+}
+
+// Parse one `depend "name" in "url" [tag "version"]` clause.
+fn _parse_depend() as *Dep {
     let is *Dep as dep = cast(*Dep, c.galloc(sizeof(Dep)));
     let is lx.Token as dep_name = lx.expect_string("depend name");
     dep.name_ptr = dep_name.ptr;
@@ -275,6 +434,12 @@ fn _parse_target_depends(t as *Target) as void {
         let is lx.Token as url_tok = lx.expect_string("depend url");
         dep.url_ptr = url_tok.ptr;
         dep.url_len = url_tok.len;
+    } else {
+        // The token was already consumed; without pushing it back it was simply
+        // dropped, so `depend "x" src "y.cst"` quietly lost the `src` key. A
+        // dependency with no url can't be resolved anyway, so say so here.
+        lx.lexer_pushback(&in_tok);
+        lx.error_at(in_tok.start, "expected 'in \"<url>\"' after the dependency name");
     }
     // optional: tag "version"
     let is lx.Token as peek = lx.next_token();
@@ -286,9 +451,7 @@ fn _parse_target_depends(t as *Target) as void {
         // not a tag clause — push the token back for the outer loop
         lx.lexer_pushback(&peek);
     }
-    // prepend to target's dep list
-    dep.next = t.deps;
-    t.deps = cast(*u8, dep);
+    return dep;
 }
 
 fn _grow_targets(proj as *Project) as void {
@@ -301,9 +464,30 @@ fn _grow_targets(proj as *Project) as void {
     proj.target_cap = newcap;
 }
 
+// Reject a second target with the same name. find_target returns the first
+// match, so the later declaration was simply never built — silently, and only
+// noticeable as "why didn't my change take effect".
+fn _check_dup_target(proj as *Project, name_tok as *lx.Token) as void {
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *Target as t = get_target(proj, i);
+        if (c.streq_n(name_tok.ptr, cast(i64, name_tok.len), t.name_ptr, t.name_len) == 1) {
+            lx.err_head(name_tok.start);
+            c.eprint("duplicate target '");
+            io._write_fd(2, name_tok.ptr, cast(i64, name_tok.len));
+            c.eprint("' (first declared at ");
+            c.eprint(lx.line_of(t.decl_off));
+            c.eprint(")");
+            lx.err_tail();
+        }
+        i = i + 1;
+    }
+}
+
 fn parse_target(proj as *Project) as void {
     let is lx.Token as name_tok = lx.expect_string("target name");
-    lx.expect_lbrace();
+    _check_dup_target(proj, &name_tok);
+    let is i64 as brace_off = lx.expect_lbrace();
 
     // Grow BEFORE taking the element pointer: big_grow moves the table, so a
     // *Target obtained earlier would dangle.
@@ -318,13 +502,33 @@ fn parse_target(proj as *Project) as void {
     while (tok.kind != lx.TK_RBRACE && tok.kind != lx.TK_EOF) {
         if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "src") == 1) {
             let is lx.Token as val = lx.expect_string("src");
-            t.src_ptr = val.ptr;
-            t.src_len = val.len;
+            let is *u8 as p = _path_of(&val);
+            t.src_ptr = p;
+            t.src_len = cast(i32, c.strlen(p));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "out") == 1) {
             let is lx.Token as val = lx.expect_string("out");
-            t.out_ptr = val.ptr;
-            t.out_len = val.len;
+            let is *u8 as p = _path_of(&val);
+            t.out_ptr = p;
+            t.out_len = cast(i32, c.strlen(p));
             t.has_out = 1;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "version_file") == 1) {
+            // Opt-in generated VERSION module (see the field's comment).
+            let is lx.Token as val = lx.expect_string("version_file");
+            let is *u8 as p = _path_of(&val);
+            t.version_file_ptr = p;
+            t.version_file_len = cast(i32, c.strlen(p));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "install") == 1) {
+            let is lx.Token as val = lx.expect_string("install");
+            t.install_ptr = c.str_dup(val.ptr, val.len);
+            t.install_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "before") == 1) {
+            // Script to run before this target builds; repeatable, in order.
+            let is lx.Token as val = lx.expect_string("before");
+            t.before = _link_name(t.before, _new_name(&val));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "after") == 1) {
+            // Script to run after a SUCCESSFUL build; repeatable, in order.
+            let is lx.Token as val = lx.expect_string("after");
+            t.after = _link_name(t.after, _new_name(&val));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "flags") == 1) {
             let is lx.Token as val = lx.expect_string("flags");
             t.flags_ptr = val.ptr;
@@ -343,18 +547,15 @@ fn parse_target(proj as *Project) as void {
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "source") == 1) {
             // Extra Caustic module, compiled --module-only and linked in.
             let is lx.Token as val = lx.expect_string("source");
-            t.inputs = _link_input(t.inputs, _new_input(IN_SRC, &val));
-            t.input_count = t.input_count + 1;
+            _add_inputs(t, IN_SRC, &val);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "asm") == 1) {
             // Hand-written assembly, run through caustic-as (-> <path>.o).
             let is lx.Token as val = lx.expect_string("asm");
-            t.inputs = _link_input(t.inputs, _new_input(IN_ASM, &val));
-            t.input_count = t.input_count + 1;
+            _add_inputs(t, IN_ASM, &val);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "obj") == 1) {
             // Already-built object, linked as-is.
             let is lx.Token as val = lx.expect_string("obj");
-            t.inputs = _link_input(t.inputs, _new_input(IN_OBJ, &val));
-            t.input_count = t.input_count + 1;
+            _add_inputs(t, IN_OBJ, &val);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "mode") == 1) {
             // CSE output mode (only used with --target=caustic-x86_64)
             let is lx.Token as val = lx.expect_string("mode");
@@ -380,15 +581,42 @@ fn parse_target(proj as *Project) as void {
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "depend") == 1) {
             _parse_target_depends(t);
         } else if (tok.kind == lx.TK_IDENT) {
-            c.eprint("error: unknown target key '");
+            // A block keyword inside a target means the '}' is missing, not that
+            // someone invented a key — say the useful thing.
+            if (c.streq(tok.ptr, tok.len, "target") == 1
+                || c.streq(tok.ptr, tok.len, "script") == 1
+                || c.streq(tok.ptr, tok.len, "profile") == 1) {
+                lx.err_head(brace_off);
+                c.eprint("unclosed '{' for target '");
+                io._write_fd(2, t.name_ptr, cast(i64, t.name_len));
+                c.eprint("' — '");
+                io._write_fd(2, tok.ptr, cast(i64, tok.len));
+                c.eprint("' at ");
+                c.eprint(lx.line_of(tok.start));
+                c.eprint(" starts a new block");
+                lx.err_tail();
+            }
+            lx.err_head(tok.start);
+            c.eprint("unknown target key '");
             io._write_fd(2, tok.ptr, cast(i64, tok.len));
             c.eprint("' in target '");
             io._write_fd(2, t.name_ptr, cast(i64, t.name_len));
             c.eprint("'");
-            c.write_nl(2);
-            io.exit(1);
+            lx.err_tail();
+        } else {
+            lx.error_at(tok.start, "expected a target key or '}'");
         }
         tok = lx.next_token();
+    }
+    // A '}' that never came used to end the loop silently at EOF: the rest of
+    // the file became this target's body and every later target vanished
+    // without a word — the same failure mode the '#'-comment bug had.
+    if (tok.kind == lx.TK_EOF) {
+        lx.err_head(brace_off);
+        c.eprint("unclosed '{' for target '");
+        io._write_fd(2, t.name_ptr, cast(i64, t.name_len));
+        c.eprint("' — no matching '}' before end of file");
+        lx.err_tail();
     }
 }
 
@@ -412,9 +640,27 @@ fn _grow_cmds(s as *Script) as void {
     s.cmd_cap = newcap;
 }
 
+fn _check_dup_script(proj as *Project, name_tok as *lx.Token) as void {
+    let is i32 as i with mut = 0;
+    while (i < proj.script_count) {
+        let is *Script as s = get_script(proj, i);
+        if (c.streq_n(name_tok.ptr, cast(i64, name_tok.len), s.name_ptr, s.name_len) == 1) {
+            lx.err_head(name_tok.start);
+            c.eprint("duplicate script '");
+            io._write_fd(2, name_tok.ptr, cast(i64, name_tok.len));
+            c.eprint("' (first declared at ");
+            c.eprint(lx.line_of(s.decl_off));
+            c.eprint(")");
+            lx.err_tail();
+        }
+        i = i + 1;
+    }
+}
+
 fn parse_script(proj as *Project) as void {
     let is lx.Token as name_tok = lx.expect_string("script name");
-    lx.expect_lbrace();
+    _check_dup_script(proj, &name_tok);
+    let is i64 as brace_off = lx.expect_lbrace();
 
     _grow_scripts(proj);
     let is i32 as idx = proj.script_count;
@@ -425,6 +671,7 @@ fn parse_script(proj as *Project) as void {
     s.cmd_count = 0;
     s.cmd_cap = 0;
     s.env = cast(*u8, 0);
+    s.decl_off = name_tok.start;
     proj.script_count = idx + 1;
 
     let is lx.Token as tok with mut;
@@ -441,19 +688,254 @@ fn parse_script(proj as *Project) as void {
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env_default") == 1) {
             s.env = _link_env(s.env, _new_env(1));
         } else if (tok.kind == lx.TK_IDENT) {
-            c.eprint("error: unknown script key '");
+            lx.err_head(tok.start);
+            c.eprint("unknown script key '");
             io._write_fd(2, tok.ptr, cast(i64, tok.len));
             c.eprint("'");
-            c.write_nl(2);
-            io.exit(1);
+            lx.err_tail();
         }
         tok = lx.next_token();
     }
+    if (tok.kind == lx.TK_EOF) {
+        lx.err_head(brace_off);
+        c.eprint("unclosed '{' for script '");
+        io._write_fd(2, s.name_ptr, cast(i64, s.name_len));
+        c.eprint("' — no matching '}' before end of file");
+        lx.err_tail();
+    }
+}
+
+// `profile "release" { flags "-O2" }` — the same build settings a project can
+// declare, selectable per invocation with `--profile release`.
+fn parse_profile(proj as *Project) as void {
+    let is lx.Token as name_tok = lx.expect_string("profile name");
+    let is i64 as brace_off = lx.expect_lbrace();
+
+    let is *Profile as p = cast(*Profile, c.galloc(sizeof(Profile)));
+    p.name_ptr = name_tok.ptr;
+    p.name_len = name_tok.len;
+    p.flags_ptr = cast(*u8, 0);
+    p.flags_len = 0;
+    p.ldflags_ptr = cast(*u8, 0);
+    p.ldflags_len = 0;
+    p.asflags_ptr = cast(*u8, 0);
+    p.asflags_len = 0;
+    p.mode_ptr = cast(*u8, 0);
+    p.mode_len = 0;
+    p.extension_ptr = cast(*u8, 0);
+    p.extension_len = 0;
+    p.out_dir_ptr = cast(*u8, 0);
+    p.out_dir_len = 0;
+    p.next = cast(*u8, 0);
+
+    let is lx.Token as tok with mut;
+    tok = lx.next_token();
+    while (tok.kind != lx.TK_RBRACE && tok.kind != lx.TK_EOF) {
+        if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "flags") == 1) {
+            let is lx.Token as val = lx.expect_string("flags");
+            p.flags_ptr = val.ptr;
+            p.flags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "ldflags") == 1) {
+            let is lx.Token as val = lx.expect_string("ldflags");
+            p.ldflags_ptr = val.ptr;
+            p.ldflags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "asflags") == 1) {
+            let is lx.Token as val = lx.expect_string("asflags");
+            p.asflags_ptr = val.ptr;
+            p.asflags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "mode") == 1) {
+            let is lx.Token as val = lx.expect_string("mode");
+            p.mode_ptr = val.ptr;
+            p.mode_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "extension") == 1) {
+            let is lx.Token as val = lx.expect_string("extension");
+            p.extension_ptr = val.ptr;
+            p.extension_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "out_dir") == 1) {
+            let is lx.Token as val = lx.expect_string("out_dir");
+            let is *u8 as v = _path_of(&val);
+            p.out_dir_ptr = v;
+            p.out_dir_len = cast(i32, c.strlen(v));
+        } else if (tok.kind == lx.TK_IDENT) {
+            lx.err_head(tok.start);
+            c.eprint("unknown profile key '");
+            io._write_fd(2, tok.ptr, cast(i64, tok.len));
+            c.eprint("'");
+            lx.err_tail();
+        }
+        tok = lx.next_token();
+    }
+    if (tok.kind == lx.TK_EOF) {
+        lx.err_head(brace_off);
+        c.eprint("unclosed '{' for profile '");
+        io._write_fd(2, name_tok.ptr, cast(i64, name_tok.len));
+        c.eprint("'");
+        lx.err_tail();
+    }
+
+    // append, preserving declaration order
+    if (cast(i64, proj.profiles) == 0) {
+        proj.profiles = cast(*u8, p);
+    } else {
+        let is *Profile as q with mut = cast(*Profile, proj.profiles);
+        while (cast(i64, q.next) != 0) { q = cast(*Profile, q.next); }
+        q.next = cast(*u8, p);
+    }
+}
+
+// The profile selected with --profile, or null. Resolved once by main and read
+// by the build driver when it composes each target's effective settings.
+let is *u8 as _active_profile with mut;
+
+fn select_profile(proj as *Project, name as *u8) as i32 {
+    let is *Profile as p with mut = cast(*Profile, proj.profiles);
+    while (cast(i64, p) != 0) {
+        if (c.streq_n(p.name_ptr, cast(i64, p.name_len), name, cast(i32, c.strlen(name))) == 1) {
+            _active_profile = cast(*u8, p);
+            return 1;
+        }
+        p = cast(*Profile, p.next);
+    }
+    return 0;
+}
+
+fn active_profile() as *Profile {
+    return cast(*Profile, _active_profile);
+}
+
+// === Effective build settings ===
+// A setting can be declared at three scopes: the project, the selected profile,
+// and the target. Flag lists CONCATENATE in that order (so a target's own flag
+// comes last and wins with the compiler's last-one-wins parsing), while
+// single-valued settings take the narrowest declaration.
+//
+// These live here rather than in the build driver because both the driver and
+// the output-path logic need the same answers, and because "what does this
+// target actually build with" is a question about the parsed project.
+
+fn _append_part(out as *u8, ptr as *u8, len as i32) as *u8 {
+    if (len == 0) { return out; }
+    let is *u8 as v = c.str_dup(ptr, len);
+    if (c.strlen(out) == 0) { return v; }
+    return c.str_cat3(out, " ", v);
+}
+
+fn eff_flags(t as *Target, proj as *Project) as *u8 {
+    let is *u8 as out with mut = c.str_dup("", 0);
+    out = _append_part(out, proj.flags_ptr, proj.flags_len);
+    let is *Profile as p = active_profile();
+    if (cast(i64, p) != 0) { out = _append_part(out, p.flags_ptr, p.flags_len); }
+    out = _append_part(out, t.flags_ptr, t.flags_len);
+    return out;
+}
+
+fn eff_ldflags(t as *Target, proj as *Project) as *u8 {
+    let is *u8 as out with mut = c.str_dup("", 0);
+    out = _append_part(out, proj.ldflags_ptr, proj.ldflags_len);
+    let is *Profile as p = active_profile();
+    if (cast(i64, p) != 0) { out = _append_part(out, p.ldflags_ptr, p.ldflags_len); }
+    out = _append_part(out, t.ldflags_ptr, t.ldflags_len);
+    return out;
+}
+
+fn eff_asflags(t as *Target, proj as *Project) as *u8 {
+    let is *u8 as out with mut = c.str_dup("", 0);
+    out = _append_part(out, proj.asflags_ptr, proj.asflags_len);
+    let is *Profile as p = active_profile();
+    if (cast(i64, p) != 0) { out = _append_part(out, p.asflags_ptr, p.asflags_len); }
+    out = _append_part(out, t.asflags_ptr, t.asflags_len);
+    return out;
+}
+
+// Narrowest wins: target, else profile, else project, else "".
+fn eff_mode(t as *Target, proj as *Project) as *u8 {
+    if (t.mode_len > 0) { return c.str_dup(t.mode_ptr, t.mode_len); }
+    let is *Profile as p = active_profile();
+    if (cast(i64, p) != 0 && p.mode_len > 0) { return c.str_dup(p.mode_ptr, p.mode_len); }
+    if (proj.mode_len > 0) { return c.str_dup(proj.mode_ptr, proj.mode_len); }
+    return c.str_dup("", 0);
+}
+
+fn eff_extension(t as *Target, proj as *Project) as *u8 {
+    if (t.extension_len > 0) { return c.str_dup(t.extension_ptr, t.extension_len); }
+    let is *Profile as p = active_profile();
+    if (cast(i64, p) != 0 && p.extension_len > 0) { return c.str_dup(p.extension_ptr, p.extension_len); }
+    if (proj.extension_len > 0) { return c.str_dup(proj.extension_ptr, proj.extension_len); }
+    return c.str_dup("", 0);
+}
+
+fn eff_allow_unsupported(t as *Target, proj as *Project) as i32 {
+    if (t.allow_unsupported == 1) { return 1; }
+    if (proj.allow_unsupported == 1) { return 1; }
+    return 0;
+}
+
+fn eff_out_dir(proj as *Project) as *u8 {
+    let is *Profile as p = active_profile();
+    if (cast(i64, p) != 0 && p.out_dir_len > 0) { return c.str_dup(p.out_dir_ptr, p.out_dir_len); }
+    if (proj.out_dir_len > 0) { return c.str_dup(proj.out_dir_ptr, proj.out_dir_len); }
+    return c.str_dup("build", 5);
+}
+
+// Files already pulled in by `include`, so a cycle is an error rather than an
+// infinite descent. Keyed on the path as written after prefixing.
+let is *u8 as _included with mut;      // *Name list
+
+fn _mark_included(path as *u8) as i32 {
+    let is *Name as n with mut = cast(*Name, _included);
+    while (cast(i64, n) != 0) {
+        if (c.streq_lit(n.ptr, path) == 1) { return 0; }
+        n = cast(*Name, n.next);
+    }
+    let is *Name as e = cast(*Name, c.galloc(sizeof(Name)));
+    e.ptr = path;
+    e.len = cast(i32, c.strlen(path));
+    e.next = _included;
+    _included = cast(*u8, e);
+    return 1;
+}
+
+// Parse an included Causticfile into the SAME project. Its own path-valued keys
+// are relative to it, so the include's directory becomes the prefix for the
+// duration — that is what lets a top-level Causticfile pull in a subdirectory's
+// (say a userspace tree of 75 targets) without rewriting a single path.
+//
+// Not prefixed: paths embedded inside `flags` text (`--path kernel`). Rewriting
+// flag strings would mean parsing the compiler's whole option grammar; an
+// included file that needs those should spell them relative to the top level.
+fn _parse_include(proj as *Project, tok as *lx.Token) as void {
+    let is *u8 as path = _path_of(tok);
+    if (_mark_included(path) == 0) {
+        lx.error_at_tok(tok.start, "include cycle: '", tok.ptr, tok.len, "' is already being parsed");
+    }
+    let is i64 as size = c.read_file_size(path);
+    if (size == 0) {
+        lx.error_at_tok(tok.start, "cannot read include '", tok.ptr, tok.len, "'");
+    }
+    let is *u8 as isrc = c.read_file(path);
+    if (cast(i64, isrc) == 0) {
+        lx.error_at_tok(tok.start, "cannot read include '", tok.ptr, tok.len, "'");
+    }
+
+    let is lx.LexState as saved;
+    lx.lexer_save(&saved);
+    let is *u8 as saved_prefix = _path_prefix;
+    _path_prefix = c.path_dirname(path);
+    lx.lexer_init(isrc, size, path);
+    _parse_body(proj);
+    _path_prefix = saved_prefix;
+    lx.lexer_restore(&saved);
 }
 
 fn parse(src as *u8, src_len as i64) as Project {
-    lx.lexer_init(src, src_len);
+    return parse_file(src, src_len, "Causticfile");
+}
+
+fn parse_file(src as *u8, src_len as i64, fname as *u8) as Project {
+    lx.lexer_init(src, src_len, fname);
     system_lib_count = 0;
+    _path_prefix = cast(*u8, 0);
+    _included = cast(*u8, 0);
 
     let is Project as proj;
     proj.name_ptr = cast(*u8, 0);
@@ -474,7 +956,30 @@ fn parse(src as *u8, src_len as i64) as Project {
     proj.script_count = 0;
     proj.script_cap = 0;
     proj.env = cast(*u8, 0);
+    proj.flags_ptr = cast(*u8, 0);
+    proj.flags_len = 0;
+    proj.ldflags_ptr = cast(*u8, 0);
+    proj.ldflags_len = 0;
+    proj.asflags_ptr = cast(*u8, 0);
+    proj.asflags_len = 0;
+    proj.mode_ptr = cast(*u8, 0);
+    proj.mode_len = 0;
+    proj.extension_ptr = cast(*u8, 0);
+    proj.extension_len = 0;
+    proj.allow_unsupported = 0;
+    proj.out_dir_ptr = cast(*u8, 0);
+    proj.out_dir_len = 0;
+    proj.toolchain_ptr = cast(*u8, 0);
+    proj.toolchain_len = 0;
+    proj.prefix_ptr = cast(*u8, 0);
+    proj.prefix_len = 0;
+    proj.profiles = cast(*u8, 0);
 
+    _parse_body(&proj);
+    return proj;
+}
+
+fn _parse_body(proj as *Project) as void {
     let is lx.Token as tok with mut;
     tok = lx.next_token();
     while (tok.kind != lx.TK_EOF) {
@@ -494,28 +999,75 @@ fn parse(src as *u8, src_len as i64) as Project {
             let is lx.Token as val = lx.expect_string("license");
             proj.license_ptr = val.ptr;
             proj.license_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "flags") == 1) {
+            // Project-wide compiler flags; every target inherits them.
+            let is lx.Token as val = lx.expect_string("flags");
+            proj.flags_ptr = val.ptr;
+            proj.flags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "ldflags") == 1) {
+            let is lx.Token as val = lx.expect_string("ldflags");
+            proj.ldflags_ptr = val.ptr;
+            proj.ldflags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "asflags") == 1) {
+            let is lx.Token as val = lx.expect_string("asflags");
+            proj.asflags_ptr = val.ptr;
+            proj.asflags_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "mode") == 1) {
+            let is lx.Token as val = lx.expect_string("mode");
+            proj.mode_ptr = val.ptr;
+            proj.mode_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "extension") == 1) {
+            let is lx.Token as val = lx.expect_string("extension");
+            proj.extension_ptr = val.ptr;
+            proj.extension_len = val.len;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "allow_unsupported") == 1) {
+            let is lx.Token as _val = lx.expect_string("allow_unsupported");
+            proj.allow_unsupported = 1;
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "out_dir") == 1) {
+            // Where a target with no explicit `out` lands (default "build").
+            let is lx.Token as val = lx.expect_string("out_dir");
+            let is *u8 as v = _path_of(&val);
+            proj.out_dir_ptr = v;
+            proj.out_dir_len = cast(i32, c.strlen(v));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "toolchain") == 1) {
+            // Directory holding caustic / caustic-as / caustic-ld.
+            let is lx.Token as val = lx.expect_string("toolchain");
+            let is *u8 as v = _path_of(&val);
+            proj.toolchain_ptr = v;
+            proj.toolchain_len = cast(i32, c.strlen(v));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "prefix") == 1) {
+            // Default destination for `caustic-mk install`.
+            let is lx.Token as val = lx.expect_string("prefix");
+            let is *u8 as v = _path_of(&val);
+            proj.prefix_ptr = v;
+            proj.prefix_len = cast(i32, c.strlen(v));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "target") == 1) {
-            parse_target(&proj);
+            parse_target(proj);
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "profile") == 1) {
+            parse_profile(proj);
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "include") == 1) {
+            let is lx.Token as val = lx.expect_string("include");
+            _parse_include(proj, &val);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "system") == 1) {
             let is lx.Token as val = lx.expect_string("system lib");
-            add_system_lib(val.ptr, val.len);
+            add_system_lib(c.str_dup(val.ptr, val.len), val.len);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env") == 1) {
             // Project-wide: applies to every script command AND every build step.
             proj.env = _link_env(proj.env, _new_env(0));
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "env_default") == 1) {
             proj.env = _link_env(proj.env, _new_env(1));
+        } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "depend") == 1) {
+            // A project-wide git dependency: every target gets its --path. The
+            // README documented this shape from the start, but only the
+            // in-a-target form parsed — at the top level it was a hard error.
+            _parse_project_depend(proj);
         } else if (tok.kind == lx.TK_IDENT && c.streq(tok.ptr, tok.len, "script") == 1) {
-            parse_script(&proj);
+            parse_script(proj);
+        } else if (tok.kind == lx.TK_IDENT) {
+            lx.error_at_tok(tok.start, "unknown key '", tok.ptr, tok.len, "'");
         } else {
-            c.eprint("error: unexpected token: ");
-            if (tok.len > 0 && cast(i64, tok.ptr) != 0) {
-                io._write_fd(2, tok.ptr, cast(i64, tok.len));
-            }
-            c.write_nl(2);
-            io.exit(1);
+            lx.error_at(tok.start, "expected a key such as name / target / script");
         }
         tok = lx.next_token();
     }
-
-    return proj;
 }

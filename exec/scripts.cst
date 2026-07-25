@@ -35,16 +35,27 @@ fn exec_run(proj as *parser.Project, name as *u8, args as *i64, argc as i64) as 
     // check targets - run the built binary
     let is *parser.Target as t = sys.find_target(proj, name);
     if (cast(i64, t) != 0) {
-        let is *u8 as out_path with mut;
-        if (t.has_out == 1) {
-            out_path = c.str_dup(t.out_ptr, t.out_len);
-        } else {
-            let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
-            out_path = c.str_cat("build/", tname);
+        // One shared answer for "where is this target's output" (sysutil), so
+        // `run` can't disagree with the build about the path. This used to be a
+        // second, simpler copy that forgot the CSE `.cse`/`.exe` extension, and
+        // so looked for a file the build never wrote.
+        let is *u8 as out_path = sys.target_output_path(proj, t);
+        if (sys.file_exists(out_path) == 0) {
+            c.eprint("error: '");
+            c.eprint(out_path);
+            c.eprint("' does not exist — build the target first");
+            c.write_nl(2);
+            return 1;
+        }
+        // Run the file we just located, not whatever the PATH happens to
+        // resolve: `out "caustic"` used to launch some other caustic entirely.
+        let is *u8 as exe with mut = out_path;
+        if (out_path[0] != 47 && c.contains(out_path, "/") == 0) {
+            exe = c.str_cat("./", out_path);
         }
         // The binary itself takes the arguments (quoted so paths with spaces
         // survive the shell), not the shell that launches it.
-        let is *u8 as cmd with mut = out_path;
+        let is *u8 as cmd with mut = sys.quote_arg(exe);
         let is i64 as ai with mut = 0;
         while (ai < argc) {
             cmd = c.str_cat3(cmd, " ", sys.quote_arg(cast(*u8, args[ai])));
@@ -65,6 +76,70 @@ fn exec_test(proj as *parser.Project, args as *i64, argc as i64) as i32 {
     return exec_run(proj, "test", args, argc);
 }
 
+// `clean` used to remove only `.caustic/` and `build/`, which left behind
+// everything the staged and incremental paths write elsewhere: a `<src>.s` and
+// `<src>.s.o` beside every compiled source (the compiler derives the assembly
+// filename from the source and has no flag to redirect it), any generated
+// version file, and any output whose `out` points outside `build/`. Those
+// showed up as untracked files in the user's repository, which is the last place
+// a build system should be leaving litter.
+//
+// With a project parsed we can sweep precisely: walk the targets and remove
+// exactly what each one produces.
+fn exec_clean_project(proj as *parser.Project) as i32 {
+    if (sys.verbosity() >= sys.V_NORMAL) {
+        c.print("cleaning");
+        c.write_nl(1);
+    }
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        // the output, and the temp file a failed build may have left
+        let is *u8 as out = sys.target_output_path(proj, t);
+        _rm(out);
+        _rm(c.str_cat(out, ".tmp"));
+        // generated version module
+        if (t.version_file_len > 0) { _rm(c.str_dup(t.version_file_ptr, t.version_file_len)); }
+        // assembly + object beside the main source
+        if (t.src_len > 0) { _rm_asm(c.str_dup(t.src_ptr, t.src_len)); }
+        // …and beside every extra Caustic/asm input
+        let is *parser.Input as inp with mut = cast(*parser.Input, t.inputs);
+        while (cast(i64, inp) != 0) {
+            let is *u8 as p = c.str_dup(inp.path_ptr, inp.path_len);
+            if (inp.kind == parser.IN_SRC) { _rm_asm(p); }
+            if (inp.kind == parser.IN_ASM) { _rm(c.str_cat(p, ".o")); }
+            inp = cast(*parser.Input, inp.next);
+        }
+        i = i + 1;
+    }
+    sys.remove_dir(sys.CACHE_DIR);
+    sys.remove_dir(parser.eff_out_dir(proj));
+    return 0;
+}
+
+fn _rm(path as *u8) as void {
+    if (sys.file_exists(path) == 0) { return; }
+    if (sys.dry_run() == 1) {
+        c.print("  [dry] rm ");
+        c.print(path);
+        c.write_nl(1);
+        return;
+    }
+    io.unlink(path);
+    if (sys.verbosity() >= sys.V_VERBOSE) {
+        c.print("  rm ");
+        c.print(path);
+        c.write_nl(1);
+    }
+}
+
+// The `<src>.s` / `<src>.s.o` pair the compiler leaves next to a source.
+fn _rm_asm(src as *u8) as void {
+    _rm(c.str_cat(src, ".s"));
+    _rm(c.str_cat(src, ".s.o"));
+}
+
+// Fallback for `clean` with no readable Causticfile.
 fn exec_clean() as i32 {
     c.print("cleaning .caustic/ and build/");
     c.write_nl(1);
@@ -73,7 +148,171 @@ fn exec_clean() as i32 {
     return 0;
 }
 
-fn exec_init() as i32 {
+// `list`: what this Causticfile actually declares. The cheapest way to answer
+// "what can I build here", and the only one that doesn't involve reading the
+// file by hand — which matters at 75 targets.
+fn exec_list(proj as *parser.Project) as i32 {
+    if (proj.name_len > 0) {
+        c.print("project: ");
+        io._write_fd(1, proj.name_ptr, cast(i64, proj.name_len));
+        if (proj.version_len > 0) {
+            c.print(" ");
+            io._write_fd(1, proj.version_ptr, cast(i64, proj.version_len));
+        }
+        if (proj.license_len > 0) {
+            c.print(" (");
+            io._write_fd(1, proj.license_ptr, cast(i64, proj.license_len));
+            c.print(")");
+        }
+        c.write_nl(1);
+    }
+
+    let is *parser.Profile as pf with mut = cast(*parser.Profile, proj.profiles);
+    if (cast(i64, pf) != 0) {
+        c.print("profiles:");
+        while (cast(i64, pf) != 0) {
+            c.print(" ");
+            io._write_fd(1, pf.name_ptr, cast(i64, pf.name_len));
+            pf = cast(*parser.Profile, pf.next);
+        }
+        c.write_nl(1);
+    }
+
+    c.print("targets (");
+    c.print(c.u64_to_str(cast(i64, proj.target_count)));
+    c.print("):");
+    c.write_nl(1);
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        c.print("  ");
+        io._write_fd(1, t.name_ptr, cast(i64, t.name_len));
+        c.print("  ");
+        if (t.src_len > 0) {
+            io._write_fd(1, t.src_ptr, cast(i64, t.src_len));
+            c.print(" -> ");
+        }
+        c.print(sys.target_output_path(proj, t));
+        if (t.input_count > 0) {
+            c.print("  [+");
+            c.print(c.u64_to_str(cast(i64, t.input_count)));
+            c.print(" inputs]");
+        }
+        if (cast(i64, t.depends) != 0) {
+            c.print("  depends:");
+            let is *parser.Name as dn with mut = cast(*parser.Name, t.depends);
+            while (cast(i64, dn) != 0) {
+                c.print(" ");
+                io._write_fd(1, dn.ptr, cast(i64, dn.len));
+                dn = cast(*parser.Name, dn.next);
+            }
+        }
+        c.write_nl(1);
+        i = i + 1;
+    }
+
+    if (proj.script_count > 0) {
+        c.print("scripts:");
+        let is i32 as j with mut = 0;
+        while (j < proj.script_count) {
+            let is *parser.Script as s = parser.get_script(proj, j);
+            c.print(" ");
+            io._write_fd(1, s.name_ptr, cast(i64, s.name_len));
+            j = j + 1;
+        }
+        c.write_nl(1);
+    }
+
+    if (parser.system_lib_count > 0) {
+        c.print("system libs:");
+        let is i32 as k with mut = 0;
+        while (k < parser.system_lib_count) {
+            c.print(" ");
+            io._write_fd(1, parser.system_lib_ptr(k), cast(i64, parser.system_lib_len(k)));
+            k = k + 1;
+        }
+        c.write_nl(1);
+    }
+    return 0;
+}
+
+// `install [target]`: copy outputs to their `install` destination, or under
+// --prefix / the project's `prefix`. What the shell scripts do with `cp` at the
+// end, expressed once.
+fn exec_install(proj as *parser.Project, name as *u8, prefix as *u8) as i32 {
+    let is i32 as done with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+        let is i32 as want with mut = 1;
+        if (cast(i64, name) != 0) {
+            want = c.streq_lit(tname, name);
+        }
+        if (want == 1) {
+            // `install "bin/app"` names the destination; `--prefix` (or the
+            // project's `prefix`) is the root it hangs off, so
+            // `--prefix /usr/local` with `install "bin/app"` lands in
+            // /usr/local/bin/app — the convention every installer uses. With no
+            // `install` key the output keeps its own filename under the prefix.
+            let is *u8 as dest with mut = cast(*u8, 0);
+            if (t.install_len > 0) {
+                dest = c.str_dup(t.install_ptr, t.install_len);
+            } else if (c.strlen(prefix) > 0) {
+                dest = c.str_cat("", sys.basename(sys.target_output_path(proj, t)));
+            }
+            if (cast(i64, dest) != 0 && c.strlen(prefix) > 0 && dest[0] != 47) {
+                dest = c.path_join(prefix, dest);
+            }
+            if (cast(i64, dest) != 0) {
+                let is *u8 as src = sys.target_output_path(proj, t);
+                if (sys.file_exists(src) == 0) {
+                    c.eprint("error: '");
+                    c.eprint(src);
+                    c.eprint("' does not exist — build it first");
+                    c.write_nl(2);
+                    return 1;
+                }
+                sys.mkdir_parent(dest);
+                if (sys.copy_file(src, dest) != 0) {
+                    c.eprint("error: install failed: ");
+                    c.eprint(dest);
+                    c.write_nl(2);
+                    return 1;
+                }
+                if (sys.verbosity() >= sys.V_NORMAL) {
+                    c.print("  installed: ");
+                    c.print(dest);
+                    c.write_nl(1);
+                }
+                done = done + 1;
+            } else if (cast(i64, name) != 0) {
+                c.eprint("error: target '");
+                c.eprint(name);
+                c.eprint("' has no 'install' path and no --prefix was given");
+                c.write_nl(2);
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (done == 0) {
+        c.eprint("error: nothing to install (no 'install' key, no --prefix)");
+        c.write_nl(2);
+        return 1;
+    }
+    return 0;
+}
+
+fn exec_init(force as i32) as i32 {
+    // Refuse to overwrite an existing manifest. `init` opened the file for
+    // writing unconditionally, so running it in a directory that already had a
+    // project destroyed that project's build description.
+    if (sys.file_exists("Causticfile") == 1 && force == 0) {
+        c.eprint("error: Causticfile already exists (use --force to overwrite)");
+        c.write_nl(2);
+        return 1;
+    }
     c.print("project name: ");
     // read from stdin
     let is [256]u8 as name_buf;

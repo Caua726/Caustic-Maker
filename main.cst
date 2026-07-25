@@ -12,11 +12,185 @@ fn print_usage() as void {
     c.print("  build <target>      build a target ('all' = every target)\n");
     c.print("  run <name> [args]   run script or target (args become $1..$n / argv)\n");
     c.print("  test [args]         run 'test' script\n");
-    c.print("  clean               remove .caustic/ and build/\n");
+    c.print("  list                show targets, scripts and profiles\n");
+    c.print("  info <target>       print the commands a build would run\n");
+    c.print("  watch [target]      rebuild whenever an input changes\n");
+    c.print("  install [target]    copy outputs to their install path / --prefix\n");
+    c.print("  clean               remove build artifacts\n");
     c.print("  init                create a new Causticfile\n\n");
     c.print("build flags:\n");
-    c.print("  --incremental   separate compilation, reuse unchanged objects\n");
-    c.print("  --continue      keep going when a dependency target fails\n");
+    c.print("  -j N, --parallel N  build N targets at once (default: CPU count)\n");
+    c.print("  --incremental       separate compilation, reuse unchanged objects\n");
+    c.print("  --continue          keep going when a target fails\n");
+    c.print("  --force             rebuild even if outputs look up to date\n");
+    c.print("  --profile <name>    apply a `profile` block from the Causticfile\n");
+    c.print("  --target=<triple>   override the target triple\n");
+    c.print("  -n, --dry-run       print commands without running them\n");
+    c.print("  -q, --quiet         only errors\n");
+    c.print("  -v, --verbose       show environment and full commands\n");
+    c.print("  --time              report per-target and total time\n");
+    c.print("  --prefix <dir>      install destination\n");
+    c.print("  --interval <ms>     watch poll interval (default 400)\n");
+}
+
+// Parsed command line. Everything the commands need, in one place, so an
+// unknown flag can be rejected in exactly one spot.
+struct Opts {
+    continue_flag as i32;
+    incremental as i32;
+    force as i32;
+    no_deps as i32;
+    dry_run as i32;
+    show_time as i32;
+    verbosity as i32;
+    jobs as i32;
+    interval as i64;
+    profile as *u8;
+    triple as *u8;
+    prefix as *u8;
+    positional as *u8;      // first non-flag argument after the command
+    arg_start as i64;       // index where forwarded arguments begin (run/test)
+}
+
+fn _opts_init(o as *Opts) as void {
+    o.continue_flag = 0;
+    o.incremental = 0;
+    o.force = 0;
+    o.no_deps = 0;
+    o.dry_run = 0;
+    o.show_time = 0;
+    o.verbosity = sys.V_NORMAL;
+    o.jobs = 0;
+    o.interval = 400;
+    o.profile = cast(*u8, 0);
+    o.triple = cast(*u8, 0);
+    o.prefix = cast(*u8, 0);
+    o.positional = cast(*u8, 0);
+    o.arg_start = 0 - 1;
+}
+
+fn _missing(flag as *u8) as i32 {
+    c.eprint("error: ");
+    c.eprint(flag);
+    c.eprint(" needs a value");
+    c.write_nl(2);
+    return 1;
+}
+
+fn _parse_int(s as *u8) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] >= 48 && s[i] <= 57) {
+        v = v * 10 + (cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+// Parse flags from `argv[from..argc)`. `forwards` is for run/test, where
+// everything after the name (or after a `--`) belongs to the child, not to us.
+//
+// An unrecognised flag is an error. It used to be ignored in silence, so
+// `--incremntal` did a full build and `-j 8` — which the README documented and
+// nothing implemented — did nothing at all.
+fn _parse_opts(o as *Opts, argv_arr as *i64, argc as i64, from as i64, forwards as i32) as i32 {
+    let is i64 as i with mut = from;
+    while (i < argc) {
+        let is *u8 as a = cast(*u8, argv_arr[i]);
+        if (forwards == 1 && c.streq_lit(a, "--") == 1) {
+            o.arg_start = i + 1;
+            return 0;
+        }
+        if (a[0] != 45) {                                  // not a flag
+            if (cast(i64, o.positional) == 0) {
+                o.positional = a;
+                if (forwards == 1) {
+                    // For run/test the remaining words are the child's.
+                    o.arg_start = i + 1;
+                    return 0;
+                }
+            } else {
+                c.eprint("error: unexpected argument '");
+                c.eprint(a);
+                c.eprint("'");
+                c.write_nl(2);
+                return 1;
+            }
+        } else if (c.streq_lit(a, "--continue") == 1) { o.continue_flag = 1; }
+        else if (c.streq_lit(a, "--incremental") == 1) { o.incremental = 1; }
+        else if (c.streq_lit(a, "--force") == 1) { o.force = 1; }
+        else if (c.streq_lit(a, "--no-deps") == 1) { o.no_deps = 1; }
+        else if (c.streq_lit(a, "-n") == 1 || c.streq_lit(a, "--dry-run") == 1) { o.dry_run = 1; }
+        else if (c.streq_lit(a, "--time") == 1) { o.show_time = 1; }
+        else if (c.streq_lit(a, "-q") == 1 || c.streq_lit(a, "--quiet") == 1) { o.verbosity = sys.V_QUIET; }
+        else if (c.streq_lit(a, "-v") == 1 || c.streq_lit(a, "--verbose") == 1) { o.verbosity = sys.V_VERBOSE; }
+        else if (c.streq_lit(a, "-j") == 1 || c.streq_lit(a, "--parallel") == 1) {
+            i = i + 1;
+            if (i >= argc) { return _missing(a); }
+            o.jobs = cast(i32, _parse_int(cast(*u8, argv_arr[i])));
+        } else if (c.streq_lit(a, "--profile") == 1) {
+            i = i + 1;
+            if (i >= argc) { return _missing(a); }
+            o.profile = cast(*u8, argv_arr[i]);
+        } else if (c.streq_lit(a, "--prefix") == 1) {
+            i = i + 1;
+            if (i >= argc) { return _missing(a); }
+            o.prefix = cast(*u8, argv_arr[i]);
+        } else if (c.streq_lit(a, "--interval") == 1) {
+            i = i + 1;
+            if (i >= argc) { return _missing(a); }
+            o.interval = _parse_int(cast(*u8, argv_arr[i]));
+            if (o.interval < 50) { o.interval = 50; }
+        } else if (c.starts_with(a, "--target=") == 1) {
+            o.triple = cast(*u8, cast(i64, a) + 9);
+        } else {
+            c.eprint("error: unknown flag '");
+            c.eprint(a);
+            c.eprint("'");
+            c.write_nl(2);
+            print_usage();
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Apply the options that live in module state (output control, job count,
+// target override) before any command runs.
+fn _apply_opts(o as *Opts) as void {
+    sys.set_verbosity(o.verbosity);
+    sys.set_dry_run(o.dry_run);
+    sys.set_jobs(o.jobs);
+    build.set_force(o.force);
+    build.set_show_time(o.show_time);
+    build.set_no_deps(o.no_deps);
+    if (cast(i64, o.triple) != 0) { sys.set_target_override(o.triple); }
+}
+
+// Walk up from the current directory looking for a Causticfile, and chdir to the
+// directory holding it — so `caustic-mk build x` works from a subdirectory the
+// way `git` does, instead of only from the project root.
+fn _find_manifest() as i32 {
+    if (io.exists("Causticfile") == 1) { return 1; }
+    let is i32 as up with mut = 0;
+    while (up < 32) {
+        if (sys.chdir("..") != 0) { return 0; }
+        if (io.exists("Causticfile") == 1) {
+            if (sys.verbosity() >= sys.V_NORMAL) {
+                let is *u8 as cwd = c.galloc(4096);
+                if (io.get_cwd(cwd, 4096) >= 0) {
+                    c.print("(project root: ");
+                    c.print(cwd);
+                    c.print(")");
+                    c.write_nl(1);
+                }
+            }
+            return 1;
+        }
+        up = up + 1;
+    }
+    return 0;
 }
 
 fn main(argc as i64, argv as i64) as i32 {
@@ -33,74 +207,149 @@ fn main(argc as i64, argv as i64) as i32 {
 
     let is *u8 as cmd = cast(*u8, argv_arr[1]);
 
-    // clean and init don't need Causticfile
-    if (c.streq_lit(cmd, "clean") == 1) {
-        return scripts.exec_clean();
-    }
-    if (c.streq_lit(cmd, "init") == 1) {
-        return scripts.exec_init();
+    // Asking for help is not an error. `--help` used to fall through to the
+    // unknown-command branch, which printed the usage but on stderr behind an
+    // "error:" line and exited non-zero — so a script guarding on the exit code
+    // treated a help request as a failure.
+    if (c.streq_lit(cmd, "help") == 1
+        || c.streq_lit(cmd, "--help") == 1
+        || c.streq_lit(cmd, "-h") == 1) {
+        print_usage();
+        return 0;
     }
 
-    if (c.streq_lit(cmd, "build") == 1 && argc < 3) {
+    let is Opts as o;
+    _opts_init(&o);
+    let is i32 as forwards with mut = 0;
+    if (c.streq_lit(cmd, "run") == 1 || c.streq_lit(cmd, "test") == 1) { forwards = 1; }
+    if (_parse_opts(&o, argv_arr, argc, 2, forwards) != 0) { return 1; }
+    _apply_opts(&o);
+
+    // init doesn't need a Causticfile (and must not go looking for someone
+    // else's in a parent directory).
+    if (c.streq_lit(cmd, "init") == 1) {
+        return scripts.exec_init(o.force);
+    }
+
+    if (c.streq_lit(cmd, "build") == 1 && cast(i64, o.positional) == 0) {
         c.eprint("error: no target specified\n");
         c.eprint("usage: caustic-mk build <target>\n");
         return 1;
     }
 
-    let is i64 as file_size = c.read_file_size("Causticfile");
-    if (file_size == 0) {
-        c.eprint("error: Causticfile not found\n");
+    if (_find_manifest() == 0) {
+        // `clean` still does its best without a manifest: the fixed directories
+        // are all it can know about.
+        if (c.streq_lit(cmd, "clean") == 1) { return scripts.exec_clean(); }
+        c.eprint("error: Causticfile not found (searched here and every parent)\n");
         return 1;
     }
 
+    let is i64 as file_size = c.read_file_size("Causticfile");
+    if (file_size == 0) {
+        c.eprint("error: Causticfile is empty\n");
+        return 1;
+    }
     let is *u8 as src = c.read_file("Causticfile");
     if (cast(i64, src) == 0) {
         c.eprint("error: could not read Causticfile\n");
         return 1;
     }
 
-    let is parser.Project as proj = parser.parse(src, file_size);
+    sys.set_manifest_path("Causticfile");
+    let is parser.Project as proj = parser.parse_file(src, file_size, "Causticfile");
+
+    // `toolchain` tells us where caustic / caustic-as / caustic-ld live.
+    if (proj.toolchain_len > 0) {
+        sys.set_toolchain_dir(c.str_dup(proj.toolchain_ptr, proj.toolchain_len));
+    }
+    // A profile changes what gets compiled, so its artifacts get their own cache
+    // — otherwise a release object would satisfy a debug build.
+    if (cast(i64, o.profile) != 0) {
+        if (parser.select_profile(&proj, o.profile) == 0) {
+            c.eprint("error: no profile named '");
+            c.eprint(o.profile);
+            c.eprint("' in the Causticfile");
+            c.write_nl(2);
+            return 1;
+        }
+        sys.set_cache_tag(o.profile);
+    }
 
     if (c.streq_lit(cmd, "build") == 1) {
-        let is *u8 as target_name = cast(*u8, argv_arr[2]);
-        let is i32 as continue_flag with mut = 0;
-        let is i32 as incremental with mut = 0;
-        let is i64 as fi with mut = 3;
-        while (fi < argc) {
-            let is *u8 as flag = cast(*u8, argv_arr[fi]);
-            if (c.streq_lit(flag, "--continue") == 1) { continue_flag = 1; }
-            if (c.streq_lit(flag, "--incremental") == 1) { incremental = 1; }
-            fi = fi + 1;
-        }
         // `build all` builds every target, unless the Causticfile defines a
         // target actually named "all" (which then wins, group-style).
-        if (c.streq_lit(target_name, "all") == 1
+        if (c.streq_lit(o.positional, "all") == 1
             && cast(i64, sys.find_target(&proj, "all")) == 0) {
-            return build.exec_build_all(&proj, continue_flag, incremental);
+            return build.exec_build_all(&proj, o.continue_flag, o.incremental);
         }
-        return build.exec_build(&proj, target_name, continue_flag, incremental);
+        return build.exec_build(&proj, o.positional, o.continue_flag, o.incremental);
+    }
+
+    // `info` is a dry run of one target: it prints the exact command sequence the
+    // build would execute — both the answer to "what does this target actually
+    // do" and a check that flags land where you think they do.
+    if (c.streq_lit(cmd, "info") == 1) {
+        if (cast(i64, o.positional) == 0) {
+            c.eprint("error: usage: caustic-mk info <target>\n");
+            return 1;
+        }
+        sys.set_dry_run(1);
+        build.set_force(1);          // show the commands, not "up to date"
+        return build.exec_build(&proj, o.positional, o.continue_flag, o.incremental);
+    }
+
+    if (c.streq_lit(cmd, "list") == 1) {
+        return scripts.exec_list(&proj);
+    }
+
+    if (c.streq_lit(cmd, "watch") == 1) {
+        let is *u8 as name with mut = o.positional;
+        if (cast(i64, name) == 0) {
+            if (proj.target_count == 0) {
+                c.eprint("error: no targets in Causticfile\n");
+                return 1;
+            }
+            let is *parser.Target as first = parser.get_target(&proj, 0);
+            name = c.str_dup(first.name_ptr, first.name_len);
+        }
+        return build.exec_watch(&proj, name, o.continue_flag, o.incremental, o.interval);
+    }
+
+    if (c.streq_lit(cmd, "install") == 1) {
+        let is *u8 as prefix with mut = "";
+        if (cast(i64, o.prefix) != 0) { prefix = o.prefix; }
+        else if (proj.prefix_len > 0) { prefix = c.str_dup(proj.prefix_ptr, proj.prefix_len); }
+        return scripts.exec_install(&proj, o.positional, prefix);
+    }
+
+    if (c.streq_lit(cmd, "clean") == 1) {
+        return scripts.exec_clean_project(&proj);
     }
 
     if (c.streq_lit(cmd, "run") == 1) {
-        if (argc < 3) {
+        if (cast(i64, o.positional) == 0) {
             c.eprint("error: no name specified\n");
             c.eprint("usage: caustic-mk run <name> [args...]\n");
             return 1;
         }
-        let is *u8 as name = cast(*u8, argv_arr[2]);
         // Everything after the name is forwarded: a script sees it as its
         // positional parameters ($1..$n, $@), a target as its own argv.
-        // A leading "--" is dropped so flags can't be mistaken for ours.
-        let is i64 as first with mut = 3;
-        if (argc > 3 && c.streq_lit(cast(*u8, argv_arr[3]), "--") == 1) { first = 4; }
-        return scripts.exec_run(&proj, name,
+        let is i64 as first with mut = o.arg_start;
+        if (first < 0) { first = argc; }
+        if (first < argc && c.streq_lit(cast(*u8, argv_arr[first]), "--") == 1) { first = first + 1; }
+        return scripts.exec_run(&proj, o.positional,
                                 cast(*i64, cast(i64, argv) + first * 8),
                                 argc - first);
     }
 
     if (c.streq_lit(cmd, "test") == 1) {
+        // `test` takes no name of its own, so anything the option parser treated
+        // as the positional is really the first forwarded argument.
         let is i64 as first with mut = 2;
-        if (argc > 2 && c.streq_lit(cast(*u8, argv_arr[2]), "--") == 1) { first = 3; }
+        if (o.arg_start > 0) { first = o.arg_start; }
+        if (cast(i64, o.positional) != 0 && o.arg_start > 0) { first = o.arg_start - 1; }
+        if (first < argc && c.streq_lit(cast(*u8, argv_arr[first]), "--") == 1) { first = first + 1; }
         return scripts.exec_test(&proj,
                                  cast(*i64, cast(i64, argv) + first * 8),
                                  argc - first);

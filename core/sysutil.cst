@@ -10,6 +10,43 @@ let is *u8 as CACHE_DIR  with imut = ".caustic";
 let is *u8 as DEPS_DIR   with imut = ".caustic/deps";
 let is *u8 as TAG_SUFFIX with imut = "/.caustic-tag";
 
+// === Output control ===
+// Verbosity levels. QUIET prints only errors and the final result; NORMAL (the
+// default) echoes one line per command, as the maker always has; VERBOSE also
+// shows the environment prologue actually handed to the shell.
+let is i32 as V_QUIET   with imut = 0;
+let is i32 as V_NORMAL  with imut = 1;
+let is i32 as V_VERBOSE with imut = 2;
+
+let is i32 as _verbosity with mut = 1;
+let is i32 as _dry_run with mut = 0;
+
+fn set_verbosity(v as i32) as void { _verbosity = v; }
+fn verbosity() as i32 { return _verbosity; }
+
+// Dry-run: every command is printed and nothing is executed. Also consulted by
+// the callers that touch the filesystem directly (rename/unlink/mkdir), so a
+// dry run really leaves the tree untouched.
+fn set_dry_run(v as i32) as void { _dry_run = v; }
+fn dry_run() as i32 { return _dry_run; }
+
+// The platform's bit bucket, and the redirection suffix that silences a command
+// on both shells. `>/dev/null` under cmd.exe tries to create a file called
+// `\dev\null`, the directory does not exist, and the whole command fails — so
+// every silenced command has to ask for this instead of hardcoding the path.
+fn devnull() as *u8 {
+    if (os.current() == os.OS_WINDOWS) { return "NUL"; }
+    return "/dev/null";
+}
+
+fn quiet_suffix() as *u8 {
+    return c.str_cat(" >", devnull());
+}
+
+fn silent_suffix() as *u8 {
+    return c.str_cat3(" >", devnull(), " 2>&1");
+}
+
 // === Subprocess ===
 
 // Environment prologue for a command. Declared `env` / `env_default` entries
@@ -152,10 +189,52 @@ fn _expand_win(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
 // then target/script, so the narrower scope wins). args/argc are the extra
 // arguments from `caustic-mk run <script> -- <args>`; on Linux they become the
 // shell's positional parameters.
-fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
-               args as *i64, argc as i64) as i32 {
-    c.print("  > ");
-    c.print(cmd);
+// Render a command for DISPLAY, showing control characters as escapes. The
+// command itself still receives the real bytes — this only changes what is
+// printed. A `"printf 'a b\n' | awk …"` command contains a real newline (the
+// lexer turns `\n` into one), and echoing it raw split the progress line in two,
+// so the tail read like stray program output. With -v and --dry-run the echo is
+// meant to be read as a script, and a line broken mid-command misleads.
+fn display_cmd(cmd as *u8) as *u8 {
+    let is i64 as len = c.strlen(cmd);
+    let is i64 as extra with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (cmd[i] < 32 || cmd[i] == 127) { extra = extra + 3; }
+        i = i + 1;
+    }
+    if (extra == 0) { return cmd; }
+    let is *u8 as out = c.galloc(len + extra + 1);
+    let is i64 as o with mut = 0;
+    i = 0;
+    while (i < len) {
+        let is u8 as ch = cmd[i];
+        if (ch == 10) { out[o] = cast(u8, 92); out[o + 1] = cast(u8, 110); o = o + 2; }        // \n
+        else if (ch == 9) { out[o] = cast(u8, 92); out[o + 1] = cast(u8, 116); o = o + 2; }    // \t
+        else if (ch == 13) { out[o] = cast(u8, 92); out[o + 1] = cast(u8, 114); o = o + 2; }   // \r
+        else if (ch < 32 || ch == 127) {
+            // Anything else unprintable as \xNN, so the echo stays one line.
+            out[o] = cast(u8, 92); out[o + 1] = cast(u8, 120); o = o + 2;
+            out[o] = _hex_digit((cast(i32, ch) >> 4) & 15); o = o + 1;
+            out[o] = _hex_digit(cast(i32, ch) & 15); o = o + 1;
+        } else {
+            out[o] = ch;
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    out[o] = cast(u8, 0);
+    return out;
+}
+
+fn _hex_digit(v as i32) as u8 {
+    if (v < 10) { return cast(u8, 48 + v); }
+    return cast(u8, 87 + v);            // 'a'..'f'
+}
+
+fn _echo_cmd(prefix as *u8, cmd as *u8, args as *i64, argc as i64) as void {
+    c.print(prefix);
+    c.print(display_cmd(cmd));
     if (argc > 0) {
         // Bracketed: these are the shell's positional parameters, not text
         // appended to the command.
@@ -163,15 +242,41 @@ fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
         let is i64 as ai with mut = 0;
         while (ai < argc) {
             c.print(" ");
-            c.print(cast(*u8, args[ai]));
+            c.print(display_cmd(cast(*u8, args[ai])));
             ai = ai + 1;
         }
         c.print("]");
     }
     c.write_nl(1);
+}
 
+fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
+               args as *i64, argc as i64) as i32 {
+    // Dry run: show the command, change nothing, report success so the caller
+    // walks the whole plan instead of bailing at the first step.
+    if (_dry_run == 1) {
+        _echo_cmd("  [dry] ", cmd, args, argc);
+        return 0;
+    }
+    if (_verbosity >= V_NORMAL) { _echo_cmd("  > ", cmd, args, argc); }
+
+    let is i64 as pid = spawn_cmd_env(cmd, env1, env2, args, argc);
+    if (pid < 0) { c.eprint("error: spawn failed\n"); return 1; }
+    return proc.wait_pid(pid);
+}
+
+// Same as run_cmd_env but returns the child's pid/handle WITHOUT waiting, so a
+// caller can keep several running at once (`build -j N`). The command has
+// already been echoed; the caller reaps with proc.wait_pid or wait_any.
+fn spawn_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
+                 args as *i64, argc as i64) as i64 {
     if (os.current() == os.OS_LINUX) {
         let is *u8 as full with mut = c.str_cat(_env_prologue(env1, 0), _env_prologue(env2, 0));
+        if (_verbosity >= V_VERBOSE && c.strlen(full) > 0) {
+            c.print("    env: ");
+            c.print(full);
+            c.write_nl(1);
+        }
         full = c.str_cat(full, cmd);
         // argv: sh -c <cmd> <$0> <$1..$n> NULL
         let is *i64 as sargv = cast(*i64, c.galloc((argc + 5) * 8));
@@ -182,9 +287,7 @@ fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
         let is i64 as i with mut = 0;
         while (i < argc) { sargv[4 + i] = args[i]; i = i + 1; }
         sargv[4 + argc] = 0;
-        let is i64 as pid = proc.spawn("/bin/sh", cast(*u8, sargv));
-        if (pid < 0) { c.eprint("error: spawn failed\n"); return 1; }
-        return proc.wait_pid(pid);
+        return proc.spawn("/bin/sh", cast(*u8, sargv));
     }
     if (os.current() == os.OS_WINDOWS) {
         // CreateProcessA accepts a single command-line string. We pass the
@@ -193,14 +296,75 @@ fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
         let is *u8 as full with mut = c.str_cat("cmd.exe /c ", _env_prologue(env1, 1));
         full = c.str_cat3(full, _env_prologue(env2, 1), body);
         let is i64 as h = proc.spawn(full, cast(*u8, 0));
-        if (h == 0 - 1) { c.eprint("error: spawn failed\n"); return 1; }
-        return proc.wait_pid(h);
+        if (h == 0 - 1) { return 0 - 1; }
+        return h;
     }
-    return 1;
+    return 0 - 1;
+}
+
+// Reap whichever child finishes first, writing its exit code to *out_rc and
+// returning its pid. Returns -1 when the platform has no wait-any (only Linux
+// exposes wait4(-1)); the caller then falls back to reaping in spawn order,
+// which is correct but lets a slow first job idle the other slots.
+fn wait_any(out_rc as *i32) as i64 {
+    if (os.current() == os.OS_LINUX) {
+        let is i32 as status with mut = 0;
+        let is i64 as pid = os.linux.wait4(0 - 1, &status, 0, cast(*u8, 0));
+        if (pid < 0) { return 0 - 1; }
+        *out_rc = (status >> 8) & 255;
+        return pid;
+    }
+    return 0 - 1;
 }
 
 fn run_cmd(cmd as *u8) as i32 {
     return run_cmd_env(cmd, cast(*parser.EnvVar, 0), cast(*parser.EnvVar, 0), cast(*i64, 0), 0);
+}
+
+// Wait for one specific child (the fallback when wait_any isn't available).
+fn wait_pid_of(pid as i64) as i32 {
+    return proc.wait_pid(pid);
+}
+
+// Worker count for parallel target builds: an explicit -j wins, else the number
+// of CPUs we may actually run on (sched_getaffinity, so a cgroup/taskset limit
+// is respected), capped to the amount of work available. Mirrors the
+// compiler's own _detect_jobs so `-j` means the same thing at both levels.
+let is i32 as MAX_JOBS with imut = 64;
+let is i32 as _jobs with mut = 0;
+
+fn set_jobs(n as i32) as void { _jobs = n; }
+fn jobs_requested() as i32 { return _jobs; }
+
+fn detect_jobs(ntasks as i32) as i32 {
+    let is i32 as n with mut = _jobs;
+    if (n < 1) {
+        n = 1;
+        if (os.current() == os.OS_LINUX) {
+            let is [128]u8 as mask;
+            let is i64 as mi with mut = 0;
+            while (mi < 128) { mask[mi] = cast(u8, 0); mi = mi + 1; }
+            let is i64 as r = os.linux.sched_getaffinity(0, 128, cast(*u8, &mask));
+            if (r > 0) {
+                let is i32 as cnt with mut = 0;
+                let is i64 as bi with mut = 0;
+                while (bi < r) {
+                    let is i32 as b = cast(i32, mask[bi]);
+                    let is i32 as k with mut = 0;
+                    while (k < 8) {
+                        if ((b & (1 << k)) != 0) { cnt = cnt + 1; }
+                        k = k + 1;
+                    }
+                    bi = bi + 1;
+                }
+                if (cnt >= 1) { n = cnt; }
+            }
+        }
+    }
+    if (n > ntasks) { n = ntasks; }
+    if (n > MAX_JOBS) { n = MAX_JOBS; }
+    if (n < 1) { n = 1; }
+    return n;
 }
 
 // Quote one argument for the platform's shell, so a path with spaces survives
@@ -212,8 +376,32 @@ fn quote_arg(s as *u8) as *u8 {
 
 // === Filesystem ===
 
+// Create a directory and every missing parent. io.mkdir is one syscall, so the
+// old single call could only ever create a leaf whose parent already existed:
+// an `out "dist/bin/app"` failed with ENOENT and surfaced as an unexplained
+// link error. EEXIST is not an error here — we only care that the path is there
+// afterwards.
 fn mkdir_p(path as *u8) as void {
-    io.mkdir(path);
+    if (_dry_run == 1) { return; }
+    let is i64 as len = c.strlen(path);
+    if (len == 0) { return; }
+    let is *u8 as buf = c.galloc(len + 1);
+    let is i64 as i with mut = 0;
+    while (i < len) { buf[i] = path[i]; i = i + 1; }
+    buf[len] = cast(u8, 0);
+    // Start at 1: a leading '/' is the root, not a component to create.
+    i = 1;
+    while (i < len) {
+        if (buf[i] == 47 || buf[i] == 92) {
+            let is u8 as save = buf[i];
+            buf[i] = cast(u8, 0);
+            io.mkdir(buf);
+            buf[i] = save;
+        }
+        i = i + 1;
+    }
+    io.mkdir(buf);
+    c.gfree(buf);
 }
 
 // create parent directory of a file path
@@ -232,6 +420,53 @@ fn mkdir_parent(path as *u8) as void {
         mkdir_p(dir);
         c.gfree(dir);
     }
+}
+
+// Copy a file, preserving executability. Done with our own read/write loop
+// rather than the shell's cp so a path with spaces or a quote in it needs no
+// escaping, and so a dry run is a no-op here like everywhere else. The
+// executable bit is restored explicitly: _open_write creates 0644, and an
+// installed program that isn't executable is not installed.
+fn copy_file(src as *u8, dst as *u8) as i32 {
+    if (_dry_run == 1) {
+        c.print("  [dry] copy ");
+        c.print(src);
+        c.print(" -> ");
+        c.print(dst);
+        c.write_nl(1);
+        return 0;
+    }
+    let is i64 as in_fd = io._open_read(src);
+    if (in_fd < 0) { return 1; }
+    io.unlink(dst);
+    let is i64 as out_fd = io._open_write(dst);
+    if (out_fd < 0) {
+        io._close_fd(in_fd);
+        return 1;
+    }
+    let is [65536]u8 as buf;
+    let is i32 as rc with mut = 0;
+    let is i64 as n with mut = io._read_fd(in_fd, cast(*u8, &buf), 65536);
+    while (n > 0) {
+        if (io._write_fd(out_fd, cast(*u8, &buf), n) != n) { rc = 1; n = 0; }
+        else { n = io._read_fd(in_fd, cast(*u8, &buf), 65536); }
+    }
+    if (n < 0) { rc = 1; }
+    io._close_fd(in_fd);
+    io._close_fd(out_fd);
+    if (rc == 0 && os.current() == os.OS_LINUX) { os.linux.chmod(dst, 493); }   // 0755
+    return rc;
+}
+
+// Change directory. Only Linux has a binding in std/os today (Windows would
+// need SetCurrentDirectoryA), so on Windows this fails and the caller falls back
+// to "run me from the project root" — the behaviour the maker has always had.
+fn chdir(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        if (os.linux.chdir(path) == 0) { return 0; }
+        return 1;
+    }
+    return 1;
 }
 
 fn dir_exists(path as *u8) as i32 {
@@ -259,6 +494,37 @@ fn basename(path as *u8) as *u8 {
     return path;
 }
 
+// Absolute form of a project-relative path, resolved against the cwd (which is
+// the Causticfile's directory — caustic-mk reads ./Causticfile).
+//
+// Why every source path handed to the compiler goes through this: the compiler
+// resolves a `use "../../../elsewhere/mod.cst"` against the importing file's
+// own directory, but it only normalises the `../` chain correctly when the path
+// it was GIVEN is absolute. With a relative source path the leading `../`s are
+// clamped and the module comes out as a truncated path that does not exist:
+//
+//   cd userspace && caustic coreutils/echo.cst
+//     -> Erro: nao foi possivel ler modulo: 'Caustic/std/causticos/prog.cst'
+//   cd anywhere && caustic /abs/userspace/coreutils/echo.cst
+//     -> fine
+//
+// A Causticfile declares `src "coreutils/echo.cst"` relative to itself, which
+// is the only sane convention, so the build system is what closes the gap. This
+// is also why the hand-written scripts this replaces resolved their sources
+// with `find` — an absolute path, by accident rather than by design.
+fn abs_path(p as *u8) as *u8 {
+    if (c.strlen(p) == 0) { return p; }
+    if (p[0] == 47) { return p; }               // already absolute
+    let is *u8 as buf = c.galloc(4096);
+    if (io.get_cwd(buf, 4096) < 0) {
+        c.gfree(buf);
+        return p;                               // no cwd: pass through unchanged
+    }
+    let is *u8 as joined = c.str_cat3(buf, "/", p);
+    c.gfree(buf);
+    return joined;
+}
+
 // Recursively remove a directory. Both OSes delegate to the platform's
 // shell rm: simpler than re-implementing getdents64 + Win FindFirstFileA
 // and the directory layout is fully managed by caustic-mk itself.
@@ -280,14 +546,152 @@ fn remove_dir(path as *u8) as void {
 
 // === Tool / project lookups ===
 
-// find a tool in PATH. returns heap-allocated full path or the name itself
+// === Toolchain discovery ===
+// Where `caustic`, `caustic-as` and `caustic-ld` live. Looking only at `./` (as
+// this used to) means a project that is not the compiler's own repo can only
+// build with the toolchain on PATH — which is why every sibling project's
+// build.sh starts by computing CAUSTIC_DIR by hand.
+//
+// Order, most explicit first:
+//   1. the Causticfile's `toolchain "dir"` key
+//   2. `./` — the compiler's own repo, where a bootstrap build MUST use the
+//      freshly built binary in the working tree rather than an installed one
+//   3. $CAUSTIC_DIR — the convention the hand-written scripts already use
+//   4. the directory holding this caustic-mk binary (an installed toolchain
+//      keeps its tools together)
+//   5. bare name, i.e. let the shell search PATH
+
+struct ToolPath {
+    name as *u8;
+    path as *u8;
+    next as *u8;
+}
+
+let is *u8 as _tool_cache with mut;
+let is *u8 as _toolchain_dir with mut;
+
+fn set_toolchain_dir(d as *u8) as void { _toolchain_dir = d; }
+
+fn _try_tool(dir as *u8, name as *u8) as *u8 {
+    if (cast(i64, dir) == 0) { return cast(*u8, 0); }
+    if (c.strlen(dir) == 0) { return cast(*u8, 0); }
+    let is *u8 as p = c.path_join(dir, name);
+    if (io.exists(p) == 1) { return p; }
+    return cast(*u8, 0);
+}
+
+// Path of the Causticfile in use. An input to every up-to-date decision (change
+// a target's flags and its output is stale), and the anchor for `include`.
+let is *u8 as _manifest with mut;
+
+fn set_manifest_path(p as *u8) as void { _manifest = p; }
+
+fn manifest_path() as *u8 {
+    if (cast(i64, _manifest) == 0) { return "Causticfile"; }
+    return _manifest;
+}
+
+// Absolute path of the running caustic-mk, for re-invoking ourselves as a
+// worker in a parallel build.
+fn self_path() as *u8 {
+    let is *u8 as buf = c.galloc(4096);
+    let is i64 as n = io.get_self_path(buf, 4096);
+    if (n <= 0) { return "caustic-mk"; }
+    buf[n] = cast(u8, 0);
+    return buf;
+}
+
+// Directory containing the running caustic-mk, or null if the OS won't say.
+fn self_dir() as *u8 {
+    let is *u8 as buf = c.galloc(4096);
+    let is i64 as n = io.get_self_path(buf, 4096);
+    if (n <= 0) { return cast(*u8, 0); }
+    buf[n] = cast(u8, 0);
+    return c.path_dirname(buf);
+}
+
 fn find_tool(name as *u8) as *u8 {
-    let is *u8 as local = c.str_cat("./", name);
-    if (io.exists(local) == 1) {
-        return local;
+    let is *ToolPath as e with mut = cast(*ToolPath, _tool_cache);
+    while (cast(i64, e) != 0) {
+        if (c.streq_lit(e.name, name) == 1) { return e.path; }
+        e = cast(*ToolPath, e.next);
     }
-    c.gfree(local);
-    return name;
+
+    let is *u8 as found with mut = _try_tool(_toolchain_dir, name);
+    if (cast(i64, found) == 0) { found = _try_tool(".", name); }
+    if (cast(i64, found) == 0) { found = _try_tool(env.getenv("CAUSTIC_DIR"), name); }
+    if (cast(i64, found) == 0) { found = _try_tool(self_dir(), name); }
+    if (cast(i64, found) == 0) { found = c.str_cat("", name); }
+
+    let is *ToolPath as n = cast(*ToolPath, c.galloc(sizeof(ToolPath)));
+    n.name = c.str_cat("", name);
+    n.path = found;
+    n.next = _tool_cache;
+    _tool_cache = cast(*u8, n);
+    return found;
+}
+
+// === Target override and cache layout ===
+// `--target=<triple>` on the command line overrides the one in `flags`, so one
+// Causticfile can be built for several triples without editing it. Artifacts
+// have to be kept apart per triple (and per profile): an object built for
+// windows-x86_64 must never be reused for an ELF build, and a `-O2` profile's
+// objects must not satisfy a debug build.
+let is *u8 as _target_override with mut;
+let is *u8 as _cache_tag with mut;
+
+fn set_target_override(t as *u8) as void { _target_override = t; }
+
+fn target_override() as *u8 {
+    if (cast(i64, _target_override) == 0) { return ""; }
+    return _target_override;
+}
+
+// Extra path component that keeps one variant's artifacts away from another's.
+fn set_cache_tag(t as *u8) as void { _cache_tag = t; }
+
+fn cache_dir() as *u8 {
+    let is *u8 as d with mut = c.str_cat("", CACHE_DIR);
+    if (c.strlen(target_override()) > 0) { d = c.path_join(d, target_override()); }
+    if (cast(i64, _cache_tag) != 0 && c.strlen(_cache_tag) > 0) { d = c.path_join(d, _cache_tag); }
+    return d;
+}
+
+fn cache_sub(name as *u8) as *u8 {
+    return c.path_join(cache_dir(), name);
+}
+
+// The single answer to "where does this target's output go", used both by the
+// build driver and by `run`/`install`/`clean`. It used to be computed in two
+// places, and the copy in `run` was missing the CSE extension logic — so
+// `caustic-mk run <target>` looked for a file the build never wrote.
+fn target_output_path(proj as *parser.Project, t as *parser.Target) as *u8 {
+    let is *u8 as out with mut;
+    if (t.has_out == 1) {
+        out = c.str_dup(t.out_ptr, t.out_len);
+    } else {
+        out = c.path_join(parser.eff_out_dir(proj), c.str_dup(t.name_ptr, t.name_len));
+    }
+
+    // CSE output flavour decides the extension: pure→.cse, compat/bundle→.exe
+    // (PE polyglot), or whatever `extension` says. Skipped if already there.
+    let is *u8 as mode = parser.eff_mode(t, proj);
+    if (c.strlen(mode) > 0) {
+        let is *u8 as ext with mut = ".exe";
+        let is *u8 as x = parser.eff_extension(t, proj);
+        if (c.strlen(x) > 0) { ext = c.str_cat(".", x); }
+        else if (c.streq_lit(mode, "pure") == 1) { ext = ".cse"; }
+        if (c.ends_with(out, ext) == 0) { out = c.str_cat(out, ext); }
+    }
+
+    // Cross-building for several triples from one Causticfile: give each its own
+    // subdirectory so the last build doesn't clobber the previous one's output.
+    if (c.strlen(target_override()) > 0) {
+        let is *u8 as dir = c.path_dirname(out);
+        let is *u8 as base = c.str_cat("", basename(out));
+        out = c.path_join(c.path_join(dir, target_override()), base);
+    }
+    return out;
 }
 
 fn find_target(proj as *parser.Project, name as *u8) as *parser.Target {

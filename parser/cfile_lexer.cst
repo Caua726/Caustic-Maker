@@ -21,11 +21,103 @@ struct Token {
 let is *u8 as _src with mut;
 let is i64 as _src_len with mut = 0;
 let is i64 as _pos with mut = 0;
+let is *u8 as _fname with mut;
 
-fn lexer_init(src as *u8, src_len as i64) as void {
+// A whole lexer state, so `include` can parse another file and come back.
+struct LexState {
+    src as *u8;
+    src_len as i64;
+    pos as i64;
+    fname as *u8;
+}
+
+fn lexer_init(src as *u8, src_len as i64, fname as *u8) as void {
     _src = src;
     _src_len = src_len;
     _pos = 0;
+    _fname = fname;
+}
+
+fn lexer_save(s as *LexState) as void {
+    s.src = _src;
+    s.src_len = _src_len;
+    s.pos = _pos;
+    s.fname = _fname;
+}
+
+fn lexer_restore(s as *LexState) as void {
+    _src = s.src;
+    _src_len = s.src_len;
+    _pos = s.pos;
+    _fname = s.fname;
+}
+
+fn lexer_file() as *u8 {
+    if (cast(i64, _fname) == 0) { return "Causticfile"; }
+    return _fname;
+}
+
+// === Diagnostics ===
+// Every error the parser or lexer raises is anchored to a source offset and
+// printed as `<file>:<line>:<col>: error: …`. Without it the messages named
+// only what was wrong, never where — in a Causticfile with 75 targets that is
+// a hunt, and the editor can't jump to it either.
+
+// "line N" for an offset — used when an error refers to a second location
+// (a duplicate's original declaration, an unclosed block's '{').
+fn line_of(off as i64) as *u8 {
+    let is i64 as line with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < off && i < _src_len) {
+        if (_src[i] == 10) { line = line + 1; }
+        i = i + 1;
+    }
+    return c.str_cat("line ", c.u64_to_str(line));
+}
+
+fn err_head(off as i64) as void {
+    let is i64 as line with mut = 1;
+    let is i64 as col with mut = 1;
+    let is i64 as i with mut = 0;
+    while (i < off && i < _src_len) {
+        if (_src[i] == 10) {
+            line = line + 1;
+            col = 1;
+        } else {
+            col = col + 1;
+        }
+        i = i + 1;
+    }
+    c.eprint(lexer_file());
+    c.eprint(":");
+    c.eprint(c.u64_to_str(line));
+    c.eprint(":");
+    c.eprint(c.u64_to_str(col));
+    c.eprint(": error: ");
+}
+
+// Close an error message opened with err_head and abort. The maker never tries
+// to recover from a malformed Causticfile: a half-understood project would
+// build the wrong thing.
+fn err_tail() as void {
+    c.write_nl(2);
+    io.exit(1);
+}
+
+fn error_at(off as i64, msg as *u8) as void {
+    err_head(off);
+    c.eprint(msg);
+    err_tail();
+}
+
+// error_at plus a (ptr,len) fragment quoted between the two halves — for
+// messages that name the offending key or value.
+fn error_at_tok(off as i64, pre as *u8, ptr as *u8, len as i32, post as *u8) as void {
+    err_head(off);
+    c.eprint(pre);
+    io._write_fd(2, ptr, cast(i64, len));
+    c.eprint(post);
+    err_tail();
 }
 
 // Rewind so the next next_token() re-reads `tok` (one-token lookahead undo).
@@ -98,7 +190,11 @@ fn next_token() as Token {
         _pos = _pos + 1;
         let is i64 as start = _pos;
         let is i32 as escaped with mut = 0;
-        while (_pos < _src_len && _src[_pos] != 34) {
+        // A raw newline ends the search: a string is a single line. Letting one
+        // run past the line meant a missing closing quote swallowed the next
+        // key and its value, and the complaint surfaced far away as a bogus
+        // "unknown key" — or at EOF, naming the wrong line entirely.
+        while (_pos < _src_len && _src[_pos] != 34 && _src[_pos] != 10) {
             if (_src[_pos] == 92 && _pos + 1 < _src_len) {   // '\'
                 escaped = 1;
                 _pos = _pos + 1;
@@ -106,10 +202,8 @@ fn next_token() as Token {
             _pos = _pos + 1;
         }
         let is i64 as raw_len = _pos - start;
-        if (_pos >= _src_len) {
-            c.eprint("error: unterminated string in Causticfile");
-            c.write_nl(2);
-            io.exit(1);
+        if (_pos >= _src_len || _src[_pos] == 10) {
+            error_at(start - 1, "unterminated string (a string may not span lines — use \\n)");
         }
         _pos = _pos + 1;
         tok.kind = TK_STRING;
@@ -155,30 +249,28 @@ fn next_token() as Token {
     // Anything else is a syntax error. It used to be reported as TK_EOF, which
     // made the parser stop silently and ignore the rest of the file — a stray
     // character truncated the project instead of failing it.
-    c.eprint("error: unexpected character '");
-    io._write_fd(2, cast(*u8, cast(i64, _src) + _pos), 1);
-    c.eprint("' in Causticfile");
-    c.write_nl(2);
-    io.exit(1);
+    error_at_tok(_pos, "unexpected character '", cast(*u8, cast(i64, _src) + _pos), 1, "'");
     return tok;
 }
 
 fn expect_string(msg as *u8) as Token {
     let is Token as tok = next_token();
     if (tok.kind != TK_STRING) {
-        c.eprint("error: expected string for ");
+        err_head(tok.start);
+        c.eprint("expected a quoted string for '");
         io._write_fd(2, msg, c.strlen(msg));
-        c.write_nl(2);
-        io.exit(1);
+        c.eprint("'");
+        err_tail();
     }
     return tok;
 }
 
-fn expect_lbrace() as void {
+// Returns the offset of the '{', so the matching-brace check can point back at
+// it when the block is never closed.
+fn expect_lbrace() as i64 {
     let is Token as tok = next_token();
     if (tok.kind != TK_LBRACE) {
-        c.eprint("error: expected '{'");
-        c.write_nl(2);
-        io.exit(1);
+        error_at(tok.start, "expected '{'");
     }
+    return tok.start;
 }

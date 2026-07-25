@@ -9,9 +9,14 @@ use "../parser/parser.cst" as parser;
 fn collect_dep_system_libs(dep_dir as *u8) as void {
     let is *u8 as cf_path = c.str_cat(dep_dir, "/Causticfile");
     if (sys.file_exists(cf_path) == 0) { return; }
-    let is i64 as cf_size with mut = 0;
-    let is *u8 as cf_src = c.read_small_file(cf_path, &cf_size);
-    if (cast(i64, cf_src) == 0 || cf_size == 0) { return; }
+    // read_file, not read_small_file: that one caps at 511 bytes, so a
+    // dependency whose `system` lines sat past the first half-kilobyte simply
+    // never contributed its -l flags, and the link failed with undefined
+    // symbols pointing nowhere near the cause.
+    let is i64 as cf_size = c.read_file_size(cf_path);
+    if (cf_size == 0) { return; }
+    let is *u8 as cf_src = c.read_file(cf_path);
+    if (cast(i64, cf_src) == 0) { return; }
     // mini-parse: look for system "libname" lines
     let is i64 as pos with mut = 0;
     while (pos < cf_size) {
@@ -44,8 +49,11 @@ fn collect_dep_system_libs(dep_dir as *u8) as void {
 }
 
 fn check_git() as i32 {
-    // Check if git is available (try "git --version")
-    let is i32 as rc = sys.run_cmd("git --version > /dev/null 2>&1");
+    // Check if git is available (try "git --version"). The redirection target
+    // has to come from sys: `> /dev/null` under cmd.exe tries to create a file
+    // in a directory that doesn't exist, the redirect fails, and git looked
+    // absent on every Windows machine whether or not it was installed.
+    let is i32 as rc = sys.run_cmd(c.str_cat("git --version", sys.silent_suffix()));
     if (rc != 0) {
         c.eprint("error: git is required for dependencies");
         c.write_nl(2);
@@ -54,8 +62,17 @@ fn check_git() as i32 {
     return 0;
 }
 
+// A target's own dependencies, then the project-wide ones.
 fn resolve_deps(t as *parser.Target) as i32 {
-    let is *parser.Dep as dep with mut = cast(*parser.Dep, t.deps);
+    return resolve_dep_list(t.deps);
+}
+
+fn resolve_project_deps(proj as *parser.Project) as i32 {
+    return resolve_dep_list(proj.deps);
+}
+
+fn resolve_dep_list(head as *u8) as i32 {
+    let is *parser.Dep as dep with mut = cast(*parser.Dep, head);
     if (cast(i64, dep) == 0) { return 0; }
 
     // Check git availability before trying to clone
@@ -82,9 +99,10 @@ fn resolve_deps(t as *parser.Target) as i32 {
                 let is i64 as stored_len with mut = 0;
                 let is *u8 as stored_tag = c.read_small_file(tag_file, &stored_len);
                 if (c.streq_n(stored_tag, stored_len, dep.tag_ptr, dep.tag_len) == 0) {
-                    // tag changed — remove and re-clone
-                    let is *u8 as rm_cmd = c.str_cat("rm -rf ", dep_dir);
-                    sys.run_cmd(rm_cmd);
+                    // tag changed — remove and re-clone. Through remove_dir,
+                    // which picks rm/rmdir per OS: the bare `rm -rf` here made
+                    // re-pinning a tag a Linux-only operation.
+                    sys.remove_dir(dep_dir);
                 }
             }
         }

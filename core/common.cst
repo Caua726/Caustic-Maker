@@ -135,6 +135,10 @@ fn str_cat(a as *u8, b as *u8) as *u8 {
     return buf;
 }
 
+fn str_cat4(a as *u8, b as *u8, c as *u8, d as *u8) as *u8 {
+    return str_cat(str_cat3(a, b, c), d);
+}
+
 fn str_cat3(a as *u8, b as *u8, c as *u8) as *u8 {
     let is i64 as a_len = strlen(a);
     let is i64 as b_len = strlen(b);
@@ -229,6 +233,63 @@ fn ends_with(s as *u8, suffix as *u8) as i32 {
     return 1;
 }
 
+fn starts_with(s as *u8, prefix as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (prefix[i] != 0) {
+        if (s[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Lexicographic compare: <0, 0, >0. Used to order glob matches so the object
+// list handed to the linker is deterministic.
+fn str_cmp(a as *u8, b as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    return cast(i32, a[i]) - cast(i32, b[i]);
+}
+
+// === Paths ===
+
+// Everything before the last '/' ("a/b/c.cst" -> "a/b"), or "" when the path
+// has no directory part. Accepts '\' too, so a Windows-style path works.
+fn path_dirname(path as *u8) as *u8 {
+    let is i64 as len = strlen(path);
+    let is i64 as cut with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (path[i] == 47 || path[i] == 92) { cut = i; }
+        i = i + 1;
+    }
+    if (cut < 0) { return str_dup("", 0); }
+    return str_dup(path, cast(i32, cut));
+}
+
+// Join two path fragments with a single '/'. An empty or absolute `b` wins.
+fn path_join(a as *u8, b as *u8) as *u8 {
+    if (strlen(a) == 0) { return str_cat("", b); }
+    if (strlen(b) == 0) { return str_cat("", a); }
+    if (b[0] == 47) { return str_cat("", b); }
+    if (ends_with(a, "/") == 1) { return str_cat(a, b); }
+    return str_cat3(a, "/", b);
+}
+
+// === Hashing ===
+
+fn hash_str(s as *u8) as i64 {
+    return djb2(s, strlen(s));
+}
+
+// Fold two hashes into one. Used to key a cached object on more than its
+// content (path + flags + compiler), so distinct build inputs never collide.
+fn hash_mix(a as i64, b as i64) as i64 {
+    let is i64 as h with mut = a ^ (b + cast(i64, 2654435769));
+    h = h ^ (h >> 29);
+    h = h * 5;
+    return h & cast(i64, 4611686018427387903);
+}
+
 // === File helpers ===
 
 fn read_file(path as *u8) as *u8 {
@@ -276,6 +337,144 @@ fn write_small_file(path as *u8, data as *u8, data_len as i32) as void {
     if (fd < 0) { return; }
     io._write_fd(fd, data, cast(i64, data_len));
     io._close_fd(fd);
+}
+
+// Write only when the contents would actually differ. Returns 1 if it wrote.
+// Leaving an identical file untouched keeps its mtime, which matters because
+// every generated file is an input to the up-to-date check — rewriting it byte
+// for byte would invalidate the target on every single build.
+fn write_if_changed(path as *u8, data as *u8, data_len as i32) as i32 {
+    let is i64 as old_len with mut = 0;
+    let is *u8 as old = read_small_file(path, &old_len);
+    if (cast(i64, old) != 0 && old_len == cast(i64, data_len)) {
+        if (streq_n(old, old_len, data, data_len) == 1) { return 0; }
+    }
+    write_small_file(path, data, data_len);
+    return 1;
+}
+
+// === Globs ===
+// One wildcard-bearing component, at the end of the path: `kernel/*.s`,
+// `tests/t?.cst`. Enough for the "every .s in this directory" case a
+// hand-written build script expresses with a shell glob, without dragging in a
+// recursive matcher nobody asked for.
+
+fn has_glob(s as *u8) as i32 {
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        if (s[i] == 42 || s[i] == 63) { return 1; }   // '*' '?'
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Classic iterative backtracking matcher: '*' spans any run of characters,
+// '?' exactly one. Both stay inside a single path component (the caller only
+// ever hands us a basename).
+fn glob_match(pat as *u8, name as *u8) as i32 {
+    let is i64 as pl = strlen(pat);
+    let is i64 as nl = strlen(name);
+    let is i64 as pi with mut = 0;
+    let is i64 as ni with mut = 0;
+    let is i64 as star with mut = 0 - 1;
+    let is i64 as mark with mut = 0;
+    while (ni < nl) {
+        if (pi < pl && (pat[pi] == 63 || pat[pi] == name[ni])) {
+            pi = pi + 1;
+            ni = ni + 1;
+        } else if (pi < pl && pat[pi] == 42) {
+            star = pi;
+            pi = pi + 1;
+            mark = ni;
+        } else if (star >= 0) {
+            pi = star + 1;
+            mark = mark + 1;
+            ni = mark;
+        } else {
+            return 0;
+        }
+    }
+    while (pi < pl && pat[pi] == 42) { pi = pi + 1; }
+    if (pi == pl) { return 1; }
+    return 0;
+}
+
+// Results of the last glob_expand(), consumed via glob_get(). One table reused
+// per call — the callers (parser key handlers) drain it immediately.
+let is *u8 as _glob_ptrs with mut;      // *i64 array of *u8
+let is i32 as _glob_count with mut = 0;
+let is i32 as _glob_cap with mut = 0;
+
+fn _glob_push(p as *u8) as void {
+    if (_glob_count >= _glob_cap) {
+        let is i32 as newcap with mut = _glob_cap * 2;
+        if (newcap < 16) { newcap = 16; }
+        _glob_ptrs = big_grow(_glob_ptrs, cast(i64, _glob_cap) * 8, cast(i64, newcap) * 8);
+        _glob_cap = newcap;
+    }
+    let is *i64 as arr = cast(*i64, _glob_ptrs);
+    arr[_glob_count] = cast(i64, p);
+    _glob_count = _glob_count + 1;
+}
+
+fn glob_get(idx as i32) as *u8 {
+    let is *i64 as arr = cast(*i64, _glob_ptrs);
+    return cast(*u8, arr[idx]);
+}
+
+// Expand `pattern` into the module table; returns how many paths matched.
+// A pattern with no wildcard yields itself (existence is the caller's business,
+// so a plain path behaves exactly as before). Matches come out sorted so the
+// link order of `asm "dir/*.s"` is stable across machines.
+fn glob_expand(pattern as *u8) as i32 {
+    _glob_count = 0;
+    if (has_glob(pattern) == 0) {
+        _glob_push(str_cat("", pattern));
+        return 1;
+    }
+    let is *u8 as dir = path_dirname(pattern);
+    let is *u8 as base with mut = cast(*u8, cast(i64, pattern) + strlen(dir));
+    if (base[0] == 47 || base[0] == 92) { base = cast(*u8, cast(i64, base) + 1); }
+    let is *u8 as listdir with mut = dir;
+    if (strlen(listdir) == 0) { listdir = "."; }
+
+    // Grow-and-retry: a directory bigger than the buffer would otherwise be
+    // silently truncated, which is exactly the class of bug the fixed tables
+    // used to cause.
+    let is i32 as cap with mut = 512;
+    let is i32 as n with mut = 0;
+    let is *u8 as ents with mut = cast(*u8, 0);
+    while (1 == 1) {
+        ents = big_alloc(cast(i64, cap) * sizeof(io.DirEntry));
+        n = io.list_dir(listdir, cast(*io.DirEntry, ents), cap);
+        if (n < cap) { break; }
+        big_free(ents, cast(i64, cap) * sizeof(io.DirEntry));
+        cap = cap * 2;
+    }
+    if (n <= 0) { return 0; }
+
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        let is *io.DirEntry as e = cast(*io.DirEntry, cast(i64, ents) + cast(i64, i) * sizeof(io.DirEntry));
+        let is *u8 as nm = str_dup(e.name_ptr, cast(i32, e.name_len));
+        if (glob_match(base, nm) == 1) { _glob_push(path_join(dir, nm)); }
+        i = i + 1;
+    }
+
+    // insertion sort by full path
+    let is *i64 as arr = cast(*i64, _glob_ptrs);
+    let is i32 as a with mut = 1;
+    while (a < _glob_count) {
+        let is i64 as key = arr[a];
+        let is i32 as b with mut = a - 1;
+        while (b >= 0 && str_cmp(cast(*u8, arr[b]), cast(*u8, key)) > 0) {
+            arr[b + 1] = arr[b];
+            b = b - 1;
+        }
+        arr[b + 1] = key;
+        a = a + 1;
+    }
+    return _glob_count;
 }
 
 // djb2 content hash — used to key per-module object cache entries.
