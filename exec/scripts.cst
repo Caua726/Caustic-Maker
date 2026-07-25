@@ -299,13 +299,18 @@ fn exec_install(proj as *parser.Project, name as *u8, prefix as *u8) as i32 {
             // `install "bin/app"` names the destination; `--prefix` (or the
             // project's `prefix`) is the root it hangs off, so
             // `--prefix /usr/local` with `install "bin/app"` lands in
-            // /usr/local/bin/app — the convention every installer uses. With no
-            // `install` key the output keeps its own filename under the prefix.
+            // /usr/local/bin/app — the convention every installer uses.
+            //
+            // With no `install` key the destination is `<prefix>/bin/<name>`,
+            // NOT `<prefix>/<name>`: a prefix is the root of a hierarchy
+            // (bin/, lib/, share/), so dropping an executable directly in it
+            // puts the binary somewhere no PATH looks. Declare `install` to
+            // land anywhere else.
             let is *u8 as dest with mut = cast(*u8, 0);
             if (t.install_len > 0) {
                 dest = c.str_dup(t.install_ptr, t.install_len);
             } else if (c.strlen(prefix) > 0) {
-                dest = c.str_cat("", sys.basename(sys.target_output_path(proj, t)));
+                dest = c.path_join("bin", sys.basename(sys.target_output_path(proj, t)));
             }
             if (cast(i64, dest) != 0 && c.strlen(prefix) > 0 && dest[0] != 47) {
                 dest = c.path_join(prefix, dest);

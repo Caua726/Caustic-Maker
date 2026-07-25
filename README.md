@@ -322,7 +322,12 @@ target "caustic" {
 ```
 
 `--prefix <dir>` overrides the project's; a relative `install` path hangs off the
-prefix, an absolute one is used as-is. The executable bit is preserved.
+prefix, an absolute one is used as-is. The mode follows the source, so an
+executable stays executable and a data file does not become one.
+
+A target with no `install` key lands in `<prefix>/bin/<name>` — a prefix is the
+root of a hierarchy (`bin/`, `lib/`, `share/`), so putting a binary directly in
+it would leave it where no `PATH` looks.
 
 ### Hooks
 

@@ -170,6 +170,17 @@ if use_fixture install-prefix; then
     expect_no_file "/opt/should-be-overridden" "the project prefix did not win over --prefix"
 fi
 
+# A target with NO `install` key still has to land somewhere a PATH looks: a
+# prefix is the root of a hierarchy, so <prefix>/bin/<name>, not <prefix>/<name>.
+if use_fixture nested-out; then
+    mk build app
+    expect_rc 0 "build succeeds"
+    mk install app --prefix "$CASE_DIR/pfx"
+    expect_rc 0 "install with only --prefix succeeds"
+    expect_file "$CASE_DIR/pfx/bin/app" "no install key -> <prefix>/bin/<name>"
+    expect_no_file "$CASE_DIR/pfx/app" "and not loose in the prefix root"
+fi
+
 # ─── hooks: before always, after only on success ───────────────────────────
 step "before / after hooks"
 if use_fixture hooks; then
