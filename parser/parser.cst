@@ -65,6 +65,7 @@ struct Target {
     depends as *u8;           // other targets to build first (*Name), repeatable
     env as *u8;               // per-target env declarations (*EnvVar)
     visiting as i32;          // build-time cycle marker (see exec_build)
+    done as i32;              // already built in this invocation
 }
 
 struct Dep {
@@ -254,6 +255,7 @@ fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
     t.depends = cast(*u8, 0);
     t.env = cast(*u8, 0);
     t.visiting = 0;
+    t.done = 0;
 }
 
 // Parse `depend "name" in "url" [tag "version"]` and prepend it to t.deps.

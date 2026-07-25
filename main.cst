@@ -1,6 +1,7 @@
 use "../std/io.cst" as io;
 use "../std/env.cst" as env;
 use "core/common.cst" as c;
+use "core/sysutil.cst" as sys;
 use "parser/parser.cst" as parser;
 use "exec/build.cst" as build;
 use "exec/scripts.cst" as scripts;
@@ -8,7 +9,7 @@ use "exec/scripts.cst" as scripts;
 fn print_usage() as void {
     c.print("usage: caustic-mk <command> [args]\n\n");
     c.print("commands:\n");
-    c.print("  build <target>      build a target\n");
+    c.print("  build <target>      build a target ('all' = every target)\n");
     c.print("  run <name> [args]   run script or target (args become $1..$n / argv)\n");
     c.print("  test [args]         run 'test' script\n");
     c.print("  clean               remove .caustic/ and build/\n");
@@ -70,6 +71,12 @@ fn main(argc as i64, argv as i64) as i32 {
             if (c.streq_lit(flag, "--continue") == 1) { continue_flag = 1; }
             if (c.streq_lit(flag, "--incremental") == 1) { incremental = 1; }
             fi = fi + 1;
+        }
+        // `build all` builds every target, unless the Causticfile defines a
+        // target actually named "all" (which then wins, group-style).
+        if (c.streq_lit(target_name, "all") == 1
+            && cast(i64, sys.find_target(&proj, "all")) == 0) {
+            return build.exec_build_all(&proj, continue_flag, incremental);
         }
         return build.exec_build(&proj, target_name, continue_flag, incremental);
     }

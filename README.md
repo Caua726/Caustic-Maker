@@ -20,6 +20,7 @@ Built by the toolchain itself (bootstrapped from an existing `caustic`):
 
 ```bash
 ./caustic-mk build <target>     # build one target from the Causticfile
+./caustic-mk build all          # build every target (declaration order)
 ./caustic-mk build <target> -j 8   # parallel build (default = CPU cores)
 ./caustic-mk run <name>         # run a named script (or target)
 ./caustic-mk run <name> -- a b  # forward arguments ($1..$n / $@, or the binary's argv)
@@ -114,6 +115,27 @@ the main object; listing them would duplicate their symbols.
 A `--target=` in `flags` is forwarded to the assemble and link steps. Staged
 builds are therefore limited to targets `caustic-as` can assemble (ELF and CSE
 today — it rejects `windows-x86_64`), so a PE target stays on the one-shot path.
+
+### Groups and `build all`
+
+`build all` builds every target in declaration order. A target reached as
+someone else's dependency is built once, so shared dependencies aren't rebuilt
+per consumer. Without `--continue` it stops at the first failure; with it,
+everything is attempted and the summary says how many failed.
+
+A group is just a target with only `depends`:
+
+```
+target "toolchain" {
+    depends "caustic"
+    depends "caustic-as"
+    depends "caustic-ld"
+}
+```
+
+`caustic-mk build toolchain` builds the three and nothing else. A Causticfile
+that declares its own `target "all"` keeps it — `build all` only means
+"everything" when no such target exists.
 
 ### Environment and script arguments
 

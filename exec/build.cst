@@ -540,6 +540,10 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32,
         return 1;
     }
 
+    // Built already in this invocation (as another target's dependency, or an
+    // earlier step of `build all`)? Nothing to redo.
+    if (t.done == 1) { return 0; }
+
     // resolve target depends (other targets, in declaration order). `visiting`
     // catches a cycle (a depends b depends a), which would otherwise recurse
     // until the stack ran out.
@@ -582,12 +586,71 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32,
         return 1;
     }
 
+    let is i32 as rc with mut = 0;
     if (incremental == 1) {
-        return run_pipeline_incremental(t, proj);
+        rc = run_pipeline_incremental(t, proj);
+    } else if (is_staged(t) == 1) {
+        // Extra objects or linker-only flags ⇒ drive compile/assemble/link by hand.
+        rc = run_pipeline_staged(t, proj);
+    } else {
+        rc = run_pipeline(t, proj);
     }
-    // Extra objects or linker-only flags ⇒ drive compile/assemble/link by hand.
-    if (is_staged(t) == 1) {
-        return run_pipeline_staged(t, proj);
+    if (rc == 0) { t.done = 1; }
+    return rc;
+}
+
+// `build all`: every target in the Causticfile, in declaration order. A target
+// reached as someone else's dependency is built once (see `done`), so shared
+// dependencies don't get rebuilt per consumer. Without --continue this stops at
+// the first failure; with it, everything is attempted and the summary reports
+// how many failed.
+//
+// A Causticfile that defines its own target named "all" keeps it — main.cst
+// only routes here when no such target exists — so an explicit
+// `target "all" { depends … }` (i.e. a group) still wins.
+fn exec_build_all(proj as *parser.Project, continue_flag as i32, incremental as i32) as i32 {
+    if (proj.target_count == 0) {
+        c.eprint("error: no targets in Causticfile");
+        c.write_nl(2);
+        return 1;
     }
-    return run_pipeline(t, proj);
+    c.print("building all targets (");
+    c.print(c.u64_to_str(cast(i64, proj.target_count)));
+    c.print(")");
+    c.write_nl(1);
+
+    let is i32 as failed with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as name = c.str_dup(t.name_ptr, t.name_len);
+        let is i32 as rc = exec_build(proj, name, continue_flag, incremental);
+        if (rc != 0) {
+            failed = failed + 1;
+            if (continue_flag == 0) { return rc; }
+            c.eprint("  (continuing after '");
+            c.eprint(name);
+            c.eprint("')");
+            c.write_nl(2);
+        }
+        i = i + 1;
+    }
+
+    let is i32 as ok with mut = 0;
+    let is i32 as j with mut = 0;
+    while (j < proj.target_count) {
+        if (parser.get_target(proj, j).done == 1) { ok = ok + 1; }
+        j = j + 1;
+    }
+    c.print("all: ");
+    c.print(c.u64_to_str(cast(i64, ok)));
+    c.print(" built");
+    if (failed > 0) {
+        c.print(", ");
+        c.print(c.u64_to_str(cast(i64, failed)));
+        c.print(" failed");
+    }
+    c.write_nl(1);
+    if (failed > 0) { return 1; }
+    return 0;
 }
