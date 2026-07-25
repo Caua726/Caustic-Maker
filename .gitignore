@@ -7,6 +7,9 @@
 *.cst.s.o
 .caustic/
 
+# build outputs (out_dir, and the per-triple directories under it)
+build/
+
 # the maker builds itself here
 /caustic-mk
 /caustic-mk.exe

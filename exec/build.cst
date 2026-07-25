@@ -487,12 +487,36 @@ fn _invalidate_deps(src as *u8) as void {
 
 // Swap the temp output into place (avoids overwriting a running binary) and
 // report. `rc` is the exit code of the step that produced tmp_out.
+// A PE build makes caustic-ld emit CodeView data to a `.pdb` sidecar named after
+// the output it was given — which is the TEMP name. So the debug file has to
+// follow the rename, or every Windows build leaves a `<out>.tmp.pdb` behind and
+// the `<out>.pdb` a debugger actually looks for is never created.
+//
+// Two candidate locations because the linker names the sidecar from the output's
+// BASENAME, in the current directory, rather than beside the output itself:
+// building `-o build/win/app.tmp` leaves `./app.tmp.pdb`. Both are checked so
+// this keeps working if that changes.
+fn _rescue_pdb(out_path as *u8, tmp_out as *u8) as void {
+    let is *u8 as want = c.str_cat(out_path, ".pdb");
+    let is *u8 as beside = c.str_cat(tmp_out, ".pdb");
+    let is *u8 as in_cwd = c.str_cat(sys.basename(tmp_out), ".pdb");
+    let is *u8 as found with mut = cast(*u8, 0);
+    if (sys.file_exists(beside) == 1) { found = beside; }
+    else if (sys.file_exists(in_cwd) == 1) { found = in_cwd; }
+    if (cast(i64, found) == 0) { return; }
+    if (c.streq_lit(found, want) == 1) { return; }
+    io.unlink(want);
+    io.rename(found, want);
+}
+
 fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
     if (rc != 0) {
         // Drop the partial artifact. Left behind, a stale `<out>.tmp` is both
         // litter `clean` didn't know about and a trap for anything globbing the
         // output directory.
         io.unlink(tmp_out);
+        io.unlink(c.str_cat(tmp_out, ".pdb"));
+        io.unlink(c.str_cat(sys.basename(tmp_out), ".pdb"));
         c.eprint("error: build failed");
         c.write_nl(2);
         return rc;
@@ -505,6 +529,7 @@ fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
     }
     io.unlink(out_path);
     io.rename(tmp_out, out_path);
+    _rescue_pdb(out_path, tmp_out);
     if (sys.verbosity() >= sys.V_NORMAL) {
         c.print("  built: ");
         c.print(out_path);
