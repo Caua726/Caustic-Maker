@@ -63,6 +63,13 @@ else
 fi
 
 # ---- against the latest tag ------------------------------------------------
+# Fetch first: the check compares against the latest RELEASE, and a tag pushed
+# from another checkout is invisible to a local `git tag`. Reading a stale list
+# once let this script compare 0.2.0 against v0.1.1 while v0.1.2 already existed
+# on the remote. A failure to reach the network is not fatal — it just means the
+# comparison is against what is known locally, and it says so.
+if git fetch --tags --quiet origin 2>/dev/null; then :
+else printf "  ${Y}∼${N} could not fetch tags — comparing against local tags only\n"; fi
 LAST_TAG="$(git tag --sort=-v:refname 2>/dev/null | grep -E '^v?[0-9]' | head -1)"
 if [ -z "$LAST_TAG" ]; then
     ok "no prior tag — this would be the first release (v$VER)"

@@ -4,6 +4,30 @@ All notable changes to `caustic-mk`. Versions follow the tags on this repo; the
 version lives in both `version.cst` and the `Causticfile`, and
 `tools/prerelease.sh` refuses a release when they disagree.
 
+## Unreleased
+
+Found while building and publishing the 0.2.0 artifacts.
+
+### Fixed
+
+15. **`install` with only `--prefix` dropped the binary in the prefix root.**
+    A prefix is the root of a hierarchy (`bin/`, `lib/`, `share/`), so a target
+    with no `install` key now lands in `<prefix>/bin/<name>` instead of
+    `<prefix>/<name>` — where no `PATH` looks.
+16. **`--target=` created the triple directory in the project root.** It hung the
+    directory off the target's `out`; for a manifest whose outputs are bare names
+    (`out "caustic-mk"`) that is the root, so cross-building four triples dropped
+    four directories next to the sources. It now falls back to `out_dir`, which
+    is what the README already promised.
+17. **A PE build's `.pdb` was orphaned.** `caustic-ld` names the CodeView sidecar
+    after the output it was given — the temp name — so every Windows build left a
+    stray `<out>.tmp.pdb` and the `<out>.pdb` a debugger looks for never existed.
+    It now follows the rename, and is removed when the build fails.
+18. **`tools/prerelease.sh` compared against stale tags.** It read `git tag`
+    without fetching, so a tag pushed from another checkout was invisible — it
+    once compared 0.2.0 against v0.1.1 while v0.1.2 already existed on the
+    remote. It fetches first, and says so when it cannot.
+
 ## 0.2.0
 
 The round that gave the maker an immune system. 4.7k lines of build system had no
