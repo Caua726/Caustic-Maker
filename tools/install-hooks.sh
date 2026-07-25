@@ -22,6 +22,9 @@
 # Usage:  tools/install-hooks.sh            install into this repo's hook dir
 #         tools/install-hooks.sh --force    overwrite existing hooks
 #         tools/install-hooks.sh --status   report what is installed and reachable
+#         tools/install-hooks.sh --local    point THIS repo at its own hook
+#                                           directory (repo-local config; the
+#                                           fix the parent repo uses)
 #         tools/install-hooks.sh --dispatch ALSO add a global pre-commit that
 #                                           delegates to each repo's own hook
 #                                           (touches a shared directory — opt-in)
@@ -37,13 +40,14 @@ warn() { printf "  ${Y}∼${N} %s\n" "$*"; }
 note() { printf "      ${D}%s${N}\n" "$*"; }
 die()  { printf "  ${R}✗ %s${N}\n" "$*"; exit 1; }
 
-FORCE=0; STATUS=0; DISPATCH=0
+FORCE=0; STATUS=0; DISPATCH=0; LOCAL=0
 for a in "$@"; do
     case "$a" in
         --force|-f)   FORCE=1 ;;
         --status|-s)  STATUS=1 ;;
+        --local|-l)   LOCAL=1 ;;
         --dispatch)   DISPATCH=1 ;;
-        -h|--help)    echo "usage: tools/install-hooks.sh [--force] [--status] [--dispatch]"; exit 0 ;;
+        -h|--help)    echo "usage: tools/install-hooks.sh [--force] [--status] [--local] [--dispatch]"; exit 0 ;;
         *) die "unknown argument '$a'" ;;
     esac
 done
@@ -161,11 +165,26 @@ DISPATCHER
             ok "global dispatcher installed at $GLOBAL/pre-commit"
             note "it only delegates — repos without a pre-commit are unaffected"
         fi
+    elif [ "$LOCAL" = 1 ]; then
+        # The least invasive fix, and the one the parent repo already uses: a
+        # repo-local core.hooksPath. Nothing outside this repo changes, and
+        # nothing is lost — the commit-msg guard was installed here too, so the
+        # global one being bypassed for this repo costs nothing.
+        if git config --local core.hooksPath "$HOOKS"; then
+            ok "core.hooksPath set for this repo -> $HOOKS"
+            note "both hooks now run here; undo with: git config --local --unset core.hooksPath"
+        else
+            die "could not set the repo-local core.hooksPath"
+        fi
     else
-        printf "      ${D}%s${N}\n" "This repo's pre-commit will NOT run until a dispatcher exists."
-        printf "      ${D}%s${N}\n" "Add one (writes to the shared hook directory):"
+        printf "      ${D}%s${N}\n" "This repo's pre-commit will NOT run as things stand."
+        printf "      ${D}%s${N}\n" "Recommended — repo-local, changes nothing outside this repo:"
+        printf "      ${D}%s${N}\n" "    tools/install-hooks.sh --local"
+        printf "      ${D}%s${N}\n" "(This is what the parent Caustic repo does. The commit-msg guard is"
+        printf "      ${D}%s${N}\n" " installed here too, so nothing is lost by bypassing the global one.)"
+        printf "      ${D}%s${N}\n" "Or, to fix every repo at once by writing to the shared directory:"
         printf "      ${D}%s${N}\n" "    tools/install-hooks.sh --dispatch"
-        printf "      ${D}%s${N}\n" "Or run the gate by hand:  tools/precommit.sh"
+        printf "      ${D}%s${N}\n" "Or just run the gate by hand:  tools/precommit.sh"
     fi
 fi
 
