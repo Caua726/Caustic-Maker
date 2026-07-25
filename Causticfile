@@ -1,8 +1,40 @@
+# caustic-mk's own manifest.
+#
+# Deliberately exercises the features it offers, so a plain `caustic-mk build
+# caustic-mk` puts version_file, install, profiles and hooks through their paces
+# on every build instead of only when someone remembers to test them.
+
 name "caustic-mk"
-version "0.1.0"
+version "0.2.0"
 author "Caua"
+license "MIT"
+
+# Where `caustic-mk install` puts things by default (--prefix overrides).
+prefix "/usr/local"
 
 target "caustic-mk" {
     src "main.cst"
     out "caustic-mk"
+    install "bin/caustic-mk"
+    # Keeps version.cst in step with the `version` above — which is what
+    # `caustic-mk --version` prints and what tools/prerelease.sh checks. It is
+    # tracked, not generated-and-ignored: a clean clone must have a version.
+    version_file "version.cst"
 }
+
+profile "release" { flags "-O2" }
+profile "debug"   { flags "-O0" }
+
+# Both suites. The unit half needs no toolchain beyond the compiler; the
+# black-box half spawns the maker against the fixtures in tests/fixtures/.
+script "test" {
+    "mkdir -p tests/tmp"
+    "caustic -q tests/run_tests.cst -o tests/tmp/unit"
+    "./tests/tmp/unit"
+    "./tests/integration.sh"
+}
+
+script "gate"    { "tools/precommit.sh" }
+script "cross"   { "tools/check-cross.sh" }
+script "hooks"   { "tools/install-hooks.sh" }
+script "release" { "tools/prerelease.sh" }

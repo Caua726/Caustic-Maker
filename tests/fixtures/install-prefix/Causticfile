@@ -1,0 +1,8 @@
+name "install-prefix"
+prefix "/opt/should-be-overridden"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    install "bin/app"
+}

@@ -1,0 +1,10 @@
+name "unclosed"
+
+target "first" {
+    src "main.cst"
+    out "build/first"
+
+target "second" {
+    src "main.cst"
+    out "build/second"
+}

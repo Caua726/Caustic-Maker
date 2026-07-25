@@ -1,0 +1,1 @@
+fn za() as i32 { return 1; }

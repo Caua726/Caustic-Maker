@@ -265,6 +265,18 @@ fn run_cmd_env(cmd as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar,
     return proc.wait_pid(pid);
 }
 
+// Echo a command the way run_cmd_env would, for callers that spawn it
+// themselves. Keeps the "> cmd" / "[dry] cmd" output identical between the
+// serial and the concurrent path — a build should not look different just
+// because two of its steps overlapped.
+fn echo_cmd(cmd as *u8) as void {
+    if (_dry_run == 1) {
+        _echo_cmd("  [dry] ", cmd, cast(*i64, 0), 0);
+        return;
+    }
+    if (_verbosity >= V_NORMAL) { _echo_cmd("  > ", cmd, cast(*i64, 0), 0); }
+}
+
 // Same as run_cmd_env but returns the child's pid/handle WITHOUT waiting, so a
 // caller can keep several running at once (`build -j N`). The command has
 // already been echoed; the caller reaps with proc.wait_pid or wait_any.
@@ -422,11 +434,25 @@ fn mkdir_parent(path as *u8) as void {
     }
 }
 
+// Is this file executable by us? Used to decide the destination mode of a copy.
+// Deliberately `access(X_OK)` rather than stat + st_mode: it answers exactly the
+// question that matters without hard-coding a byte offset into struct stat,
+// which is the kind of assumption that silently rots.
+fn is_executable(path as *u8) as i32 {
+    if (os.current() == os.OS_LINUX) {
+        if (os.linux.access(path, 1) == 0) { return 1; }     // X_OK
+        return 0;
+    }
+    return 0;
+}
+
 // Copy a file, preserving executability. Done with our own read/write loop
 // rather than the shell's cp so a path with spaces or a quote in it needs no
-// escaping, and so a dry run is a no-op here like everywhere else. The
-// executable bit is restored explicitly: _open_write creates 0644, and an
-// installed program that isn't executable is not installed.
+// escaping, and so a dry run is a no-op here like everywhere else.
+//
+// The mode follows the SOURCE. _open_write creates 0644, so an executable has
+// to be chmod'ed back to 0755 — but doing that unconditionally, as this used to,
+// made every installed data file executable too.
 fn copy_file(src as *u8, dst as *u8) as i32 {
     if (_dry_run == 1) {
         c.print("  [dry] copy ");
@@ -444,6 +470,7 @@ fn copy_file(src as *u8, dst as *u8) as i32 {
         io._close_fd(in_fd);
         return 1;
     }
+    let is i32 as exec_src = is_executable(src);
     let is [65536]u8 as buf;
     let is i32 as rc with mut = 0;
     let is i64 as n with mut = io._read_fd(in_fd, cast(*u8, &buf), 65536);
@@ -454,8 +481,17 @@ fn copy_file(src as *u8, dst as *u8) as i32 {
     if (n < 0) { rc = 1; }
     io._close_fd(in_fd);
     io._close_fd(out_fd);
-    if (rc == 0 && os.current() == os.OS_LINUX) { os.linux.chmod(dst, 493); }   // 0755
-    return rc;
+    if (rc != 0) { return rc; }
+    // The OS test has to be the WHOLE condition of its own `if`. Written as
+    // `if (rc == 0 && os.current() == os.OS_LINUX)`, the compiler folds
+    // os.current() to a literal but the surrounding `&&` is not a literal, so
+    // dead-branch elimination does not fire, os.linux.chmod survives into a
+    // Windows build, and its `syscall` is rejected at codegen. That is why
+    // caustic-mk could not be built for windows-x86_64 at all.
+    if (os.current() == os.OS_LINUX) {
+        if (exec_src == 1) { os.linux.chmod(dst, 493); }      // 0755
+    }
+    return 0;
 }
 
 // Change directory. Only Linux has a binding in std/os today (Windows would
@@ -477,19 +513,22 @@ fn file_exists(path as *u8) as i32 {
     return io.exists(path);
 }
 
-// extract basename from a path (after last /)
+// Everything after the last separator. Splits on '\' as well as '/', so it
+// agrees with c.path_dirname — which always accepted both. While it only split
+// on '/', an install destination derived from a Windows-style path kept the
+// whole path as its "file name".
 fn basename(path as *u8) as *u8 {
     let is i64 as len = c.strlen(path);
-    let is i64 as last_slash with mut = 0 - 1;
+    let is i64 as last_sep with mut = 0 - 1;
     let is i64 as i with mut = 0;
     while (i < len) {
-        if (path[i] == 47) {
-            last_slash = i;
+        if (path[i] == 47 || path[i] == 92) {
+            last_sep = i;
         }
         i = i + 1;
     }
-    if (last_slash >= 0) {
-        return cast(*u8, cast(i64, path) + last_slash + 1);
+    if (last_sep >= 0) {
+        return cast(*u8, cast(i64, path) + last_sep + 1);
     }
     return path;
 }
@@ -514,7 +553,10 @@ fn basename(path as *u8) as *u8 {
 // with `find` — an absolute path, by accident rather than by design.
 fn abs_path(p as *u8) as *u8 {
     if (c.strlen(p) == 0) { return p; }
-    if (p[0] == 47) { return p; }               // already absolute
+    // Already absolute — including a drive-qualified path on Windows, which the
+    // old '/'-only test called relative and then prefixed with the cwd,
+    // producing "C:/proj/C:\proj\x.cst".
+    if (c.path_is_absolute(p) == 1) { return p; }
     let is *u8 as buf = c.galloc(4096);
     if (io.get_cwd(buf, 4096) < 0) {
         c.gfree(buf);
@@ -528,20 +570,42 @@ fn abs_path(p as *u8) as *u8 {
 // Recursively remove a directory. Both OSes delegate to the platform's
 // shell rm: simpler than re-implementing getdents64 + Win FindFirstFileA
 // and the directory layout is fully managed by caustic-mk itself.
+//
+// The path is QUOTED. Splicing it in raw meant a project under a directory with
+// a space in its name handed `rm -rf /home/me/My Projects/app/build` to the
+// shell, which is two arguments — so it deleted "/home/me/My" if that existed
+// and reported nothing if it did not.
 fn remove_dir(path as *u8) as void {
     if (io.exists(path) == 0) { return; }
     if (os.current() == os.OS_LINUX) {
-        let is *u8 as cmd = c.str_cat("rm -rf ", path);
+        let is *u8 as cmd = c.str_cat("rm -rf ", quote_arg(path));
         run_cmd(cmd);
         c.gfree(cmd);
         return;
     }
     if (os.current() == os.OS_WINDOWS) {
-        let is *u8 as cmd = c.str_cat("rmdir /s /q ", path);
+        // cmd.exe's rmdir wants backslashes; a forward-slash path is rejected
+        // outright ("Invalid switch").
+        let is *u8 as cmd = c.str_cat("rmdir /s /q ", quote_arg(to_win_sep(path)));
         run_cmd(cmd);
         c.gfree(cmd);
         return;
     }
+}
+
+// Rewrite '/' as '\' for the one place that needs it: a path handed to a cmd.exe
+// builtin. Everything else on Windows (CreateFileA, CreateProcessA) accepts
+// forward slashes.
+fn to_win_sep(p as *u8) as *u8 {
+    let is i64 as len = c.strlen(p);
+    let is *u8 as out = c.galloc(len + 1);
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (p[i] == 47) { out[i] = cast(u8, 92); } else { out[i] = p[i]; }
+        i = i + 1;
+    }
+    out[len] = cast(u8, 0);
+    return out;
 }
 
 // === Tool / project lookups ===
@@ -692,6 +756,119 @@ fn target_output_path(proj as *parser.Project, t as *parser.Target) as *u8 {
         out = c.path_join(c.path_join(dir, target_override()), base);
     }
     return out;
+}
+
+// ── "did you mean" ───────────────────────────────────────────
+// Levenshtein distance, bounded: `max` lets a hopeless pair bail out early
+// instead of filling a table nobody will read. Small enough to keep the DP rows
+// on the stack — the names are Causticfile identifiers, not prose.
+
+let is i32 as SUGGEST_MAX_LEN with imut = 128;
+
+fn edit_distance(a as *u8, b as *u8, max as i32) as i32 {
+    let is i64 as la = c.strlen(a);
+    let is i64 as lb = c.strlen(b);
+    if (la > cast(i64, SUGGEST_MAX_LEN) || lb > cast(i64, SUGGEST_MAX_LEN)) { return max + 1; }
+    // A length gap alone already exceeds the budget: no need to compute.
+    let is i64 as gap with mut = la - lb;
+    if (gap < 0) { gap = 0 - gap; }
+    if (gap > cast(i64, max)) { return max + 1; }
+
+    let is [129]i32 as prev;
+    let is [129]i32 as cur;
+    let is i64 as j with mut = 0;
+    while (j <= lb) { prev[j] = cast(i32, j); j = j + 1; }
+    let is i64 as i with mut = 1;
+    while (i <= la) {
+        cur[0] = cast(i32, i);
+        j = 1;
+        while (j <= lb) {
+            let is i32 as cost with mut = 1;
+            if (a[i - 1] == b[j - 1]) { cost = 0; }
+            let is i32 as best with mut = prev[j] + 1;              // deletion
+            if (cur[j - 1] + 1 < best) { best = cur[j - 1] + 1; }   // insertion
+            if (prev[j - 1] + cost < best) { best = prev[j - 1] + cost; }
+            cur[j] = best;
+            j = j + 1;
+        }
+        j = 0;
+        while (j <= lb) { prev[j] = cur[j]; j = j + 1; }
+        i = i + 1;
+    }
+    return prev[lb];
+}
+
+// How far off a name may be and still be worth suggesting. One edit for a short
+// name, two for anything longer — beyond that a "did you mean" is noise.
+fn _suggest_budget(name as *u8) as i32 {
+    if (c.strlen(name) <= 4) { return 1; }
+    return 2;
+}
+
+// Print "did you mean 'x'?" when exactly one plausible candidate is closest.
+// Silent when nothing is close, which is the common case for a genuinely new
+// name and where a wrong guess would be worse than none.
+fn _suggest_from(name as *u8, best as *u8, best_d as i32, budget as i32) as void {
+    if (best_d > budget) { return; }
+    if (c.strlen(best) == 0) { return; }
+    c.eprint("  did you mean '");
+    c.eprint(best);
+    c.eprint("'?");
+    c.write_nl(2);
+}
+
+fn suggest_target(proj as *parser.Project, name as *u8) as void {
+    let is i32 as budget = _suggest_budget(name);
+    let is *u8 as best with mut = "";
+    let is i32 as best_d with mut = budget + 1;
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+        let is i32 as d = edit_distance(name, tname, budget);
+        if (d < best_d) { best_d = d; best = tname; }
+        i = i + 1;
+    }
+    _suggest_from(name, best, best_d, budget);
+}
+
+fn suggest_script(proj as *parser.Project, name as *u8) as void {
+    let is i32 as budget = _suggest_budget(name);
+    let is *u8 as best with mut = "";
+    let is i32 as best_d with mut = budget + 1;
+    let is i32 as i with mut = 0;
+    while (i < proj.script_count) {
+        let is *parser.Script as s = parser.get_script(proj, i);
+        let is *u8 as sname = c.str_dup(s.name_ptr, s.name_len);
+        let is i32 as d = edit_distance(name, sname, budget);
+        if (d < best_d) { best_d = d; best = sname; }
+        i = i + 1;
+    }
+    _suggest_from(name, best, best_d, budget);
+}
+
+// A name that could be either: `run` accepts a script or a target.
+fn suggest_name(proj as *parser.Project, name as *u8) as void {
+    let is i32 as budget = _suggest_budget(name);
+    let is *u8 as best with mut = "";
+    let is i32 as best_d with mut = budget + 1;
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+        let is i32 as d = edit_distance(name, tname, budget);
+        if (d < best_d) { best_d = d; best = tname; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < proj.script_count) {
+        let is *parser.Script as s = parser.get_script(proj, i);
+        let is *u8 as sname = c.str_dup(s.name_ptr, s.name_len);
+        let is i32 as d = edit_distance(name, sname, budget);
+        if (d < best_d) { best_d = d; best = sname; }
+        i = i + 1;
+    }
+    _suggest_from(name, best, best_d, budget);
 }
 
 fn find_target(proj as *parser.Project, name as *u8) as *parser.Target {

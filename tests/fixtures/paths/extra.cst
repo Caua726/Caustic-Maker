@@ -1,0 +1,3 @@
+// Linked in via `source`: reached from nothing, so it exercises the
+// multi-object link without changing the program result.
+fn helper() as i32 { return 1; }

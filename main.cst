@@ -5,6 +5,11 @@ use "core/sysutil.cst" as sys;
 use "parser/parser.cst" as parser;
 use "exec/build.cst" as build;
 use "exec/scripts.cst" as scripts;
+use "exec/doctor.cst" as doctor;
+// The version this binary reports. Kept in step with the Causticfile's
+// `version` by that target's `version_file` key, and checked by
+// tools/prerelease.sh — so `--version` cannot drift from the tag.
+use "version.cst" as ver;
 
 fn print_usage() as void {
     c.print("usage: caustic-mk <command> [args]\n\n");
@@ -14,10 +19,14 @@ fn print_usage() as void {
     c.print("  test [args]         run 'test' script\n");
     c.print("  list                show targets, scripts and profiles\n");
     c.print("  info <target>       print the commands a build would run\n");
+    c.print("  why <target>        explain the up-to-date decision\n");
+    c.print("  graph [target]      dependency tree (--dot for graphviz)\n");
     c.print("  watch [target]      rebuild whenever an input changes\n");
     c.print("  install [target]    copy outputs to their install path / --prefix\n");
-    c.print("  clean               remove build artifacts\n");
-    c.print("  init                create a new Causticfile\n\n");
+    c.print("  clean [--cache]     remove build artifacts (--cache: only the cache)\n");
+    c.print("  init                create a new Causticfile\n");
+    c.print("  doctor              check the toolchain, the manifest and its inputs\n");
+    c.print("  completions <shell> emit a bash or zsh completion script\n\n");
     c.print("build flags:\n");
     c.print("  -j N, --parallel N  build N targets at once (default: CPU count)\n");
     c.print("  --incremental       separate compilation, reuse unchanged objects\n");
@@ -31,6 +40,7 @@ fn print_usage() as void {
     c.print("  --time              report per-target and total time\n");
     c.print("  --prefix <dir>      install destination\n");
     c.print("  --interval <ms>     watch poll interval (default 400)\n");
+    c.print("  --define NAME=VALUE  override a Causticfile `set` (repeatable)\n");
 }
 
 // Parsed command line. Everything the commands need, in one place, so an
@@ -39,6 +49,8 @@ struct Opts {
     continue_flag as i32;
     incremental as i32;
     force as i32;
+    cache_only as i32;      // clean --cache: the cache, not the outputs
+    dot as i32;             // graph --dot: graphviz instead of a tree
     no_deps as i32;
     dry_run as i32;
     show_time as i32;
@@ -56,6 +68,8 @@ fn _opts_init(o as *Opts) as void {
     o.continue_flag = 0;
     o.incremental = 0;
     o.force = 0;
+    o.cache_only = 0;
+    o.dot = 0;
     o.no_deps = 0;
     o.dry_run = 0;
     o.show_time = 0;
@@ -77,14 +91,43 @@ fn _missing(flag as *u8) as i32 {
     return 1;
 }
 
-fn _parse_int(s as *u8) as i64 {
-    let is i64 as v with mut = 0;
+// A flag that takes a number must reject anything that is not one. The lax
+// parser this replaces stopped at the first non-digit, so `-j abc` came out as 0
+// — which detect_jobs reads as "auto-detect". A typo silently changed the build
+// instead of being reported, the same way an unknown flag used to.
+fn _need_int(flag as *u8, s as *u8, out as *i64) as i32 {
+    if (c.parse_int_strict(s, out) == 1) { return 0; }
+    c.eprint("error: ");
+    c.eprint(flag);
+    c.eprint(" expects a number, got '");
+    c.eprint(s);
+    c.eprint("'");
+    c.write_nl(2);
+    return 1;
+}
+
+// `--define NAME=VALUE`. Applied before the manifest is parsed, and `set` will
+// not overwrite it — so one Causticfile can serve a build matrix without being
+// edited between runs.
+fn _define(spec as *u8) as i32 {
+    let is i64 as len = c.strlen(spec);
+    let is i64 as eq with mut = 0 - 1;
     let is i64 as i with mut = 0;
-    while (s[i] >= 48 && s[i] <= 57) {
-        v = v * 10 + (cast(i64, s[i]) - 48);
+    while (i < len) {
+        if (spec[i] == 61 && eq < 0) { eq = i; }        // first '='
         i = i + 1;
     }
-    return v;
+    if (eq <= 0) {
+        c.eprint("error: --define expects NAME=VALUE, got '");
+        c.eprint(spec);
+        c.eprint("'");
+        c.write_nl(2);
+        return 1;
+    }
+    let is *u8 as name = c.str_dup(spec, cast(i32, eq));
+    let is *u8 as val = c.str_dup(cast(*u8, cast(i64, spec) + eq + 1), cast(i32, len - eq - 1));
+    parser.define_var_cli(name, val);
+    return 0;
 }
 
 // Parse flags from `argv[from..argc)`. `forwards` is for run/test, where
@@ -119,6 +162,8 @@ fn _parse_opts(o as *Opts, argv_arr as *i64, argc as i64, from as i64, forwards 
         } else if (c.streq_lit(a, "--continue") == 1) { o.continue_flag = 1; }
         else if (c.streq_lit(a, "--incremental") == 1) { o.incremental = 1; }
         else if (c.streq_lit(a, "--force") == 1) { o.force = 1; }
+        else if (c.streq_lit(a, "--cache") == 1) { o.cache_only = 1; }
+        else if (c.streq_lit(a, "--dot") == 1) { o.dot = 1; }
         else if (c.streq_lit(a, "--no-deps") == 1) { o.no_deps = 1; }
         else if (c.streq_lit(a, "-n") == 1 || c.streq_lit(a, "--dry-run") == 1) { o.dry_run = 1; }
         else if (c.streq_lit(a, "--time") == 1) { o.show_time = 1; }
@@ -127,7 +172,13 @@ fn _parse_opts(o as *Opts, argv_arr as *i64, argc as i64, from as i64, forwards 
         else if (c.streq_lit(a, "-j") == 1 || c.streq_lit(a, "--parallel") == 1) {
             i = i + 1;
             if (i >= argc) { return _missing(a); }
-            o.jobs = cast(i32, _parse_int(cast(*u8, argv_arr[i])));
+            let is i64 as jn with mut = 0;
+            if (_need_int(a, cast(*u8, argv_arr[i]), &jn) != 0) { return 1; }
+            if (jn < 1) {
+                c.eprint("error: -j needs at least 1 job\n");
+                return 1;
+            }
+            o.jobs = cast(i32, jn);
         } else if (c.streq_lit(a, "--profile") == 1) {
             i = i + 1;
             if (i >= argc) { return _missing(a); }
@@ -139,8 +190,14 @@ fn _parse_opts(o as *Opts, argv_arr as *i64, argc as i64, from as i64, forwards 
         } else if (c.streq_lit(a, "--interval") == 1) {
             i = i + 1;
             if (i >= argc) { return _missing(a); }
-            o.interval = _parse_int(cast(*u8, argv_arr[i]));
-            if (o.interval < 50) { o.interval = 50; }
+            if (_need_int(a, cast(*u8, argv_arr[i]), &o.interval) != 0) { return 1; }
+            if (o.interval < 50) { o.interval = 50; }       // a tighter poll is pointless
+        } else if (c.streq_lit(a, "--define") == 1 || c.streq_lit(a, "-D") == 1) {
+            i = i + 1;
+            if (i >= argc) { return _missing(a); }
+            if (_define(cast(*u8, argv_arr[i])) != 0) { return 1; }
+        } else if (c.starts_with(a, "--define=") == 1) {
+            if (_define(cast(*u8, cast(i64, a) + 9)) != 0) { return 1; }
         } else if (c.starts_with(a, "--target=") == 1) {
             o.triple = cast(*u8, cast(i64, a) + 9);
         } else {
@@ -218,6 +275,18 @@ fn main(argc as i64, argv as i64) as i32 {
         return 0;
     }
 
+    // Neither needs a Causticfile, and both have to work from anywhere.
+    if (c.streq_lit(cmd, "--version") == 1
+        || c.streq_lit(cmd, "-V") == 1
+        || c.streq_lit(cmd, "version") == 1) {
+        c.print("caustic-mk ");
+        c.print(ver.VERSION);
+        c.write_nl(1);
+        c.print("the build system for the Caustic toolchain, written in Caustic\n");
+        c.print("repo: github.com/Caua726/Caustic-Maker\n");
+        return 0;
+    }
+
     let is Opts as o;
     _opts_init(&o);
     let is i32 as forwards with mut = 0;
@@ -231,16 +300,14 @@ fn main(argc as i64, argv as i64) as i32 {
         return scripts.exec_init(o.force);
     }
 
-    if (c.streq_lit(cmd, "build") == 1 && cast(i64, o.positional) == 0) {
-        c.eprint("error: no target specified\n");
-        c.eprint("usage: caustic-mk build <target>\n");
-        return 1;
-    }
 
     if (_find_manifest() == 0) {
         // `clean` still does its best without a manifest: the fixed directories
         // are all it can know about.
-        if (c.streq_lit(cmd, "clean") == 1) { return scripts.exec_clean(); }
+        if (c.streq_lit(cmd, "clean") == 1) {
+            if (o.cache_only == 1) { return scripts.exec_clean_cache(); }
+            return scripts.exec_clean();
+        }
         c.eprint("error: Causticfile not found (searched here and every parent)\n");
         return 1;
     }
@@ -256,6 +323,11 @@ fn main(argc as i64, argv as i64) as i32 {
         return 1;
     }
 
+    // `when target == "..."` compares against the effective triple, so it has to
+    // be known before the manifest is read. A --target= override is all we can
+    // know at this point; a triple that only exists inside a target's `flags`
+    // cannot be, which is why `when target` documents itself as the override.
+    if (cast(i64, o.triple) != 0) { parser.set_when_triple(o.triple); }
     sys.set_manifest_path("Causticfile");
     let is parser.Project as proj = parser.parse_file(src, file_size, "Causticfile");
 
@@ -277,6 +349,17 @@ fn main(argc as i64, argv as i64) as i32 {
     }
 
     if (c.streq_lit(cmd, "build") == 1) {
+        // A bare `build` uses the project's `default` target. Without one it is
+        // still an error, but now it says what would fix it.
+        if (cast(i64, o.positional) == 0) {
+            if (proj.default_len > 0) {
+                o.positional = c.str_dup(proj.default_ptr, proj.default_len);
+            } else {
+                c.eprint("error: no target specified, and the Causticfile has no `default`\n");
+                c.eprint("usage: caustic-mk build <target>|all\n");
+                return 1;
+            }
+        }
         // `build all` builds every target, unless the Causticfile defines a
         // target actually named "all" (which then wins, group-style).
         if (c.streq_lit(o.positional, "all") == 1
@@ -303,6 +386,33 @@ fn main(argc as i64, argv as i64) as i32 {
         return scripts.exec_list(&proj);
     }
 
+    if (c.streq_lit(cmd, "doctor") == 1) {
+        return doctor.exec_doctor(&proj);
+    }
+
+    if (c.streq_lit(cmd, "completions") == 1) {
+        let is *u8 as shell with mut = o.positional;
+        if (cast(i64, shell) == 0) {
+            c.eprint("error: usage: caustic-mk completions bash|zsh\n");
+            return 1;
+        }
+        return doctor.exec_completions(&proj, shell);
+    }
+
+    // `why` answers "which input does the build think changed", using the very
+    // check a build runs — so the two can never disagree.
+    if (c.streq_lit(cmd, "why") == 1) {
+        if (cast(i64, o.positional) == 0) {
+            c.eprint("error: usage: caustic-mk why <target>\n");
+            return 1;
+        }
+        return build.exec_why(&proj, o.positional);
+    }
+
+    if (c.streq_lit(cmd, "graph") == 1) {
+        return build.exec_graph(&proj, o.positional, o.dot);
+    }
+
     if (c.streq_lit(cmd, "watch") == 1) {
         let is *u8 as name with mut = o.positional;
         if (cast(i64, name) == 0) {
@@ -324,6 +434,7 @@ fn main(argc as i64, argv as i64) as i32 {
     }
 
     if (c.streq_lit(cmd, "clean") == 1) {
+        if (o.cache_only == 1) { return scripts.exec_clean_cache(); }
         return scripts.exec_clean_project(&proj);
     }
 

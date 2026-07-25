@@ -1,0 +1,399 @@
+// tests/run_tests.cst — caustic-mk's unit suite, written in Caustic.
+//
+// Covers the pure helpers in core/ that everything else rests on: the glob
+// matcher, the path splitters, the comparator that gives the link its
+// determinism, the cache-key hashes, the shell quoter, the command echo, and
+// write_if_changed. They had no tests at all, which is how a 511-byte read
+// survived inside the function whose whole job is to NOT touch a file's mtime.
+//
+// Deliberately unit-only: nothing here spawns caustic-mk. The black-box cases
+// (a Causticfile in, an exit code out) live in tests/integration.sh, because
+// they need a process, a directory tree and a mutable cache.
+//
+// Run:  caustic tests/run_tests.cst -o build/mk-tests && ./build/mk-tests
+//   or: caustic-mk test
+// Exit 0 = all passed, 1 = something failed.
+
+use "../../std/io.cst" as io;
+use "../core/common.cst" as c;
+use "../core/sysutil.cst" as sys;
+use "../parser/parser.cst" as parser;
+
+let is i32 as _pass with mut = 0;
+let is i32 as _fail with mut = 0;
+
+fn _p(s as *u8) as void { io._write_fd(io.STDOUT, s, c.strlen(s)); }
+
+fn _check(name as *u8, ok as i32) as void {
+    if (ok == 1) { _p("  PASS  "); _pass = _pass + 1; }
+    else { _p("  FAIL  "); _fail = _fail + 1; }
+    _p(name);
+    _p("\n");
+}
+
+// Same, but shows both sides when a string comparison fails — a bare FAIL on
+// `path_join` tells you nothing about which half is wrong.
+fn _check_str(name as *u8, got as *u8, want as *u8) as void {
+    if (c.streq_lit(got, want) == 1) {
+        _p("  PASS  "); _pass = _pass + 1; _p(name); _p("\n");
+        return;
+    }
+    _fail = _fail + 1;
+    _p("  FAIL  "); _p(name);
+    _p("\n          want \""); _p(want);
+    _p("\"\n          got  \""); _p(got);
+    _p("\"\n");
+}
+
+fn _check_int(name as *u8, got as i64, want as i64) as void {
+    if (got == want) {
+        _p("  PASS  "); _pass = _pass + 1; _p(name); _p("\n");
+        return;
+    }
+    _fail = _fail + 1;
+    _p("  FAIL  "); _p(name);
+    _p("\n          want "); io.write_int(io.STDOUT, want);
+    _p("\n          got  "); io.write_int(io.STDOUT, got);
+    _p("\n");
+}
+
+// === glob_match ===
+// The matcher decides which files a `asm "kernel/*.s"` line pulls in, so a
+// wrong answer either drops an object from the link or pulls in a stray one.
+
+fn t_glob_match() as void {
+    _p("\n--- glob_match ---\n");
+    _check("*.s matches a.s",            c.glob_match("*.s", "a.s"));
+    _check("*.s rejects a.c",            cast(i32, c.glob_match("*.s", "a.c") == 0));
+    _check("*.s rejects a.s.o",          cast(i32, c.glob_match("*.s", "a.s.o") == 0));
+    _check("* matches anything",         c.glob_match("*", "whatever.txt"));
+    _check("* matches empty",            c.glob_match("*", ""));
+    _check("literal matches itself",     c.glob_match("abc", "abc"));
+    _check("literal rejects prefix",     cast(i32, c.glob_match("abc", "abcd") == 0));
+    _check("literal rejects shorter",    cast(i32, c.glob_match("abcd", "abc") == 0));
+    _check("? matches exactly one",      c.glob_match("a?c", "abc"));
+    _check("? rejects zero",             cast(i32, c.glob_match("a?c", "ac") == 0));
+    _check("? rejects two",              cast(i32, c.glob_match("a?c", "abbc") == 0));
+    _check("a* matches bare a",          c.glob_match("a*", "a"));
+    _check("t*.cst matches t_atomic.cst", c.glob_match("t*.cst", "t_atomic.cst"));
+    _check("t*.cst rejects s_atomic.cst", cast(i32, c.glob_match("t*.cst", "s_atomic.cst") == 0));
+    // The backtracking cases: a greedy first '*' has to give characters back.
+    _check("*a*b matches xaybzb",        c.glob_match("*a*b", "xaybzb"));
+    _check("*a*b matches ab",            c.glob_match("*a*b", "ab"));
+    _check("*a*b rejects ba",            cast(i32, c.glob_match("*a*b", "ba") == 0));
+    _check("*.*.o matches x.cst.o",      c.glob_match("*.*.o", "x.cst.o"));
+
+    _p("\n--- has_glob ---\n");
+    _check("has_glob sees *",            c.has_glob("a/*.s"));
+    _check("has_glob sees ?",            c.has_glob("t?.cst"));
+    _check("has_glob ignores plain",     cast(i32, c.has_glob("kernel/main.cst") == 0));
+}
+
+// === paths ===
+// path_dirname already accepts both separators; the point of these is that
+// basename and path_join agree with it, so splitting and rejoining a path is
+// not a lossy round trip.
+
+fn t_paths() as void {
+    _p("\n--- path_dirname ---\n");
+    _check_str("dirname a/b/c.cst",      c.path_dirname("a/b/c.cst"), "a/b");
+    _check_str("dirname bare name",      c.path_dirname("c.cst"), "");
+    _check_str("dirname absolute",       c.path_dirname("/abs/x"), "/abs");
+    _check_str("dirname trailing slash", c.path_dirname("a/b/"), "a/b");
+    _check_str("dirname backslash",      c.path_dirname("a\\b\\c.cst"), "a\\b");
+    _check_str("dirname mixed",          c.path_dirname("a/b\\c.cst"), "a/b");
+
+    _p("\n--- path_join ---\n");
+    _check_str("join a + b",             c.path_join("a", "b"), "a/b");
+    _check_str("join keeps one slash",   c.path_join("a/", "b"), "a/b");
+    _check_str("join empty left",        c.path_join("", "b"), "b");
+    _check_str("join empty right",       c.path_join("a", ""), "a");
+    _check_str("join absolute right",    c.path_join("a", "/abs"), "/abs");
+    _check_str("join nested",            c.path_join("dist/bin", "app"), "dist/bin/app");
+
+    _p("\n--- basename ---\n");
+    _check_str("basename a/b/c",         sys.basename("a/b/c"), "c");
+    _check_str("basename bare",          sys.basename("c"), "c");
+    _check_str("basename absolute",      sys.basename("/usr/bin/caustic"), "caustic");
+    // Consistency with path_dirname, which splits on '\' too. Without this,
+    // an install destination taken from a Windows-style path keeps the whole
+    // path as its "file name".
+    _check_str("basename backslash",     sys.basename("a\\b\\c"), "c");
+    _check_str("basename mixed",         sys.basename("a/b\\c"), "c");
+
+    // Both halves are reachable from either host on purpose: the Windows answer
+    // is the one no Linux test run would otherwise ever execute.
+    _p("\n--- path_is_absolute (posix) ---\n");
+    _check("posix /x",                   c.path_is_absolute_posix("/x"));
+    _check("posix rejects x",            cast(i32, c.path_is_absolute_posix("x") == 0));
+    _check("posix rejects a/b",          cast(i32, c.path_is_absolute_posix("a/b") == 0));
+    // On Linux these are ordinary relative file names, and treating them as
+    // rooted would be wrong.
+    _check("posix rejects backslash",    cast(i32, c.path_is_absolute_posix("\\x") == 0));
+    _check("posix rejects drive",        cast(i32, c.path_is_absolute_posix("C:\\x") == 0));
+
+    _p("\n--- path_is_absolute (windows) ---\n");
+    _check("win backslash",              c.path_is_absolute_win("\\x"));
+    _check("win forward slash",          c.path_is_absolute_win("/x"));
+    _check("win drive backslash",        c.path_is_absolute_win("C:\\x"));
+    _check("win drive slash",            c.path_is_absolute_win("C:/x"));
+    _check("win lowercase drive",        c.path_is_absolute_win("c:/x"));
+    _check("win rejects relative",       cast(i32, c.path_is_absolute_win("x") == 0));
+    _check("win rejects a/b",            cast(i32, c.path_is_absolute_win("a/b") == 0));
+    // "C:" is the current directory ON drive C, and "C:x" is relative to it —
+    // neither is rooted.
+    _check("win rejects bare drive",     cast(i32, c.path_is_absolute_win("C:") == 0));
+    _check("win rejects drive-relative", cast(i32, c.path_is_absolute_win("C:x") == 0));
+    _check("win rejects digit drive",    cast(i32, c.path_is_absolute_win("1:/x") == 0));
+    _check("win rejects empty",          cast(i32, c.path_is_absolute_win("") == 0));
+
+    _p("\n--- parse_int_strict ---\n");
+    let is i64 as pv with mut = 0 - 1;
+    _check("accepts 0",                  c.parse_int_strict("0", &pv));
+    _check_int("and yields 0",           pv, 0);
+    _check("accepts 8",                  c.parse_int_strict("8", &pv));
+    _check_int("and yields 8",           pv, 8);
+    _check("accepts 400",                c.parse_int_strict("400", &pv));
+    _check_int("and yields 400",         pv, 400);
+    _check("rejects abc",                cast(i32, c.parse_int_strict("abc", &pv) == 0));
+    _check("rejects 4x",                 cast(i32, c.parse_int_strict("4x", &pv) == 0));
+    _check("rejects empty",              cast(i32, c.parse_int_strict("", &pv) == 0));
+    _check("rejects -1",                 cast(i32, c.parse_int_strict("-1", &pv) == 0));
+    _check("rejects space",              cast(i32, c.parse_int_strict(" 4", &pv) == 0));
+    // A rejected parse must leave the caller's variable alone.
+    _check_int("rejection leaves out untouched", pv, 400);
+
+    _p("\n--- ends_with / starts_with ---\n");
+    _check("ends_with .cst",             c.ends_with("main.cst", ".cst"));
+    _check("ends_with rejects",          cast(i32, c.ends_with("main.cst", ".s") == 0));
+    _check("ends_with longer suffix",    cast(i32, c.ends_with("a", "abc") == 0));
+    _check("starts_with --target=",      c.starts_with("--target=x", "--target="));
+    _check("starts_with rejects",        cast(i32, c.starts_with("-j", "--target=") == 0));
+
+    _p("\n--- str_find / contains / extract_flag ---\n");
+    _check_int("str_find hit",           c.str_find("abcdef", "cd"), 2);
+    _check_int("str_find miss",          c.str_find("abcdef", "xy"), 0 - 1);
+    _check_int("str_find needle longer", c.str_find("ab", "abc"), 0 - 1);
+    _check("contains yes",               c.contains("a b c", "b"));
+    _check("contains no",                cast(i32, c.contains("a b c", "z") == 0));
+    _check_str("extract_flag triple",
+              c.extract_flag("-O2 --target=caustic-x86_64 --path k", "--target="),
+              "--target=caustic-x86_64");
+    _check_str("extract_flag at end",
+              c.extract_flag("-O2 --target=windows-x86_64", "--target="),
+              "--target=windows-x86_64");
+    _check("extract_flag absent",
+           cast(i32, cast(i64, c.extract_flag("-O2", "--target=")) == 0));
+
+    _p("\n--- mangle_path ---\n");
+    _check_str("mangle src/main.cst",    c.mangle_path("src/main.cst"), "_src_main_cst");
+    _check_str("mangle dashes",          c.mangle_path("a-b/c.cst"), "_a_b_c_cst");
+}
+
+// === str_cmp ===
+// This is what sorts glob matches, and the sort is what makes the object order
+// handed to the linker identical on every machine.
+
+fn t_str_cmp() as void {
+    _p("\n--- str_cmp ---\n");
+    _check("a < b",                      cast(i32, c.str_cmp("a", "b") < 0));
+    _check("b > a",                      cast(i32, c.str_cmp("b", "a") > 0));
+    _check("a == a",                     cast(i32, c.str_cmp("a", "a") == 0));
+    _check("prefix sorts first",         cast(i32, c.str_cmp("a", "ab") < 0));
+    _check("longer sorts after",         cast(i32, c.str_cmp("ab", "a") > 0));
+    _check("uppercase before lowercase", cast(i32, c.str_cmp("A", "a") < 0));
+    _check("empty first",                cast(i32, c.str_cmp("", "a") < 0));
+    _check("digits before letters",      cast(i32, c.str_cmp("1.s", "a.s") < 0));
+}
+
+// === hashing ===
+// hash_mix folds path + content + flags + compiler into one cache key. If it
+// were order-insensitive, two different builds would share an object file.
+
+fn t_hash() as void {
+    _p("\n--- hash / hash_mix ---\n");
+    _check("hash_str stable",
+           cast(i32, c.hash_str("kernel/main.cst") == c.hash_str("kernel/main.cst")));
+    _check("hash_str distinguishes",
+           cast(i32, c.hash_str("a/mod.cst") != c.hash_str("b/mod.cst")));
+    _check("hash_str positive",          cast(i32, c.hash_str("x") > 0));
+    _check("djb2 empty is seed",         cast(i32, c.djb2("", 0) == 5381));
+    _check("hash_mix stable",
+           cast(i32, c.hash_mix(11, 22) == c.hash_mix(11, 22)));
+    _check("hash_mix order matters",
+           cast(i32, c.hash_mix(11, 22) != c.hash_mix(22, 11)));
+    _check("hash_mix positive",          cast(i32, c.hash_mix(1, 2) > 0));
+    _check("hash_mix spreads zero",
+           cast(i32, c.hash_mix(0, 0) != c.hash_mix(0, 1)));
+
+    // Known epochs, checked against `date -u -d @N`. UTC, no timezone in play.
+    _p("\n--- fmt_unix_time ---\n");
+    _check_str("epoch itself",           c.fmt_unix_time(1), "1970-01-01 00:00:01");
+    _check_str("a leap day",             c.fmt_unix_time(951825600), "2000-02-29 12:00:00");
+    _check_str("day before a leap day",  c.fmt_unix_time(951739200), "2000-02-28 12:00:00");
+    _check_str("end of a year",          c.fmt_unix_time(1735689599), "2024-12-31 23:59:59");
+    _check_str("start of a year",        c.fmt_unix_time(1735689600), "2025-01-01 00:00:00");
+    _check_str("a non-leap century",     c.fmt_unix_time(4107542400), "2100-03-01 00:00:00");
+    _check_str("zero is no time",        c.fmt_unix_time(0), "(none)");
+
+    _p("\n--- u64_to_str ---\n");
+    _check_str("u64 zero",               c.u64_to_str(0), "0");
+    _check_str("u64 small",              c.u64_to_str(42), "42");
+    _check_str("u64 large",              c.u64_to_str(1234567890123), "1234567890123");
+}
+
+// === sh_quote ===
+// The env prologue splices declared values into a /bin/sh command line, so a
+// value with a space or a quote in it has to survive verbatim.
+
+fn t_sh_quote() as void {
+    _p("\n--- sh_quote ---\n");
+    _check_str("quote plain",            c.sh_quote("abc"), "'abc'");
+    _check_str("quote spaces",           c.sh_quote("a b"), "'a b'");
+    _check_str("quote empty",            c.sh_quote(""), "''");
+    _check_str("quote dollar left alone", c.sh_quote("$HOME"), "'$HOME'");
+    // The only way POSIX sh lets a single quote appear inside single quotes.
+    _check_str("quote embedded quote",   c.sh_quote("it's"), "'it'\\''s'");
+}
+
+// === display_cmd ===
+// An echoed command must stay one line: a real newline in a script command used
+// to split the progress line so the tail read as stray program output.
+
+fn t_display_cmd() as void {
+    _p("\n--- display_cmd ---\n");
+    _check_str("plain untouched",         sys.display_cmd("echo hi"), "echo hi");
+    _check_str("newline escaped",         sys.display_cmd("a\nb"), "a\\nb");
+    _check_str("tab escaped",             sys.display_cmd("a\tb"), "a\\tb");
+    _check_str("printf case",
+              sys.display_cmd("printf 'a b\n' | awk '{print $2}'"),
+              "printf 'a b\\n' | awk '{print $2}'");
+    _check_str("two newlines",            sys.display_cmd("a\nb\nc"), "a\\nb\\nc");
+}
+
+// === write_if_changed ===
+// Its entire reason to exist is leaving an unchanged file's mtime alone, because
+// every generated file is an input to the up-to-date check. A rewrite on every
+// build makes the target permanently stale.
+
+fn t_write_if_changed() as void {
+    _p("\n--- write_if_changed ---\n");
+    let is *u8 as path = "tests/tmp/wic.txt";
+
+    // Small file: the case that works today.
+    c.write_small_file(path, "hello", 5);
+    _check_int("small identical -> no write", cast(i64, c.write_if_changed(path, "hello", 5)), 0);
+    _check_int("small changed -> writes",     cast(i64, c.write_if_changed(path, "HELLO", 5)), 1);
+    _check_int("small size after write",      io.file_size(path), 5);
+
+    // Big file: 4096 bytes is past read_small_file's 511-byte window, so a
+    // byte-identical rewrite has to be detected without truncating the read.
+    let is i32 as n with mut = 4096;
+    let is *u8 as big = c.galloc(cast(i64, n) + 1);
+    let is i32 as i with mut = 0;
+    while (i < n) { big[i] = cast(u8, 97 + (i % 26)); i = i + 1; }
+    big[n] = cast(u8, 0);
+
+    c.write_small_file(path, big, n);
+    _check_int("4 KB size on disk",           io.file_size(path), cast(i64, n));
+    _check_int("4 KB identical -> no write",  cast(i64, c.write_if_changed(path, big, n)), 0);
+
+    // One byte different, same length: must be seen as a change.
+    big[4000] = cast(u8, 33);
+    _check_int("4 KB one byte differs -> writes", cast(i64, c.write_if_changed(path, big, n)), 1);
+
+    // Shrinking must truncate, not leave the old tail behind.
+    _check_int("shrink -> writes",            cast(i64, c.write_if_changed(path, "tiny", 4)), 1);
+    _check_int("shrink truncates",            io.file_size(path), 4);
+
+    io.unlink(path);
+}
+
+// === glob_expand ===
+// Needs real files, so it reads tests/fixtures/glob/, which holds a.s, b.s and
+// c.txt for exactly this.
+
+fn t_glob_expand() as void {
+    _p("\n--- glob_expand ---\n");
+    let is i32 as n = c.glob_expand("tests/fixtures/glob/*.s");
+    _check_int("*.s finds two",           cast(i64, n), 2);
+    if (n == 2) {
+        // Sorted, so the link order is the same everywhere.
+        _check_str("first match sorted",   c.glob_get(0), "tests/fixtures/glob/a.s");
+        _check_str("second match sorted",  c.glob_get(1), "tests/fixtures/glob/b.s");
+    }
+    _check_int("*.txt finds one",         cast(i64, c.glob_expand("tests/fixtures/glob/*.txt")), 1);
+    _check_int("no wildcard yields self", cast(i64, c.glob_expand("kernel/main.cst")), 1);
+    _check_str("self is the pattern",     c.glob_get(0), "kernel/main.cst");
+    _check_int("no match in real dir",    cast(i64, c.glob_expand("tests/fixtures/glob/*.nope")), 0);
+
+    // A directory that cannot be listed is NOT the same as a pattern that
+    // matched nothing: io.list_dir returns -1 there (and on every Windows host,
+    // which has no backend for it). Reporting both as 0 made every Windows glob
+    // fail with "pattern matched nothing", pointing at the wrong thing.
+    _check_int("unlistable dir -> -1",
+               cast(i64, c.glob_expand("tests/fixtures/no_such_dir/*.s")), 0 - 1);
+}
+
+// === interpolate ===
+// The substitution rule is the whole feature: declared names are replaced,
+// everything else beginning with '$' survives untouched so the shell still gets
+// its own variables and positional parameters.
+
+fn _interp(s as *u8) as *u8 { return parser.interpolate(s, cast(i32, c.strlen(s))); }
+
+fn t_interpolate() as void {
+    _p("\n--- interpolate ---\n");
+    parser.define_var("TRIPLE", "caustic-x86_64");
+    parser.define_var("DIR", "build");
+    parser.define_var("A", "1");
+
+    _check_str("plain text untouched",   _interp("no variables here"), "no variables here");
+    _check_str("bare name",              _interp("$TRIPLE"), "caustic-x86_64");
+    _check_str("braced name",            _interp("${TRIPLE}"), "caustic-x86_64");
+    _check_str("inside a path",          _interp("$DIR/app.cse"), "build/app.cse");
+    _check_str("two names",              _interp("$DIR/$TRIPLE"), "build/caustic-x86_64");
+    _check_str("braces separate names",  _interp("${A}${A}"), "11");
+    _check_str("adjacent text",          _interp("x${A}y"), "x1y");
+    // Without braces the name runs to the first non-name character, so this is
+    // the case that needs ${}.
+    _check_str("bare name eats letters", _interp("$Ay"), "$Ay");
+    _check_str("$$ escapes",             _interp("$$TRIPLE"), "$TRIPLE");
+    _check_str("$$ alone",               _interp("$$"), "$");
+
+    // Everything the shell owns has to survive byte for byte.
+    _check_str("shell positional",       _interp("echo $1"), "echo $1");
+    _check_str("shell all args",         _interp("echo $@"), "echo $@");
+    _check_str("shell env var",          _interp("--path $CAUSTIC_DIR/std"), "--path $CAUSTIC_DIR/std");
+    _check_str("awk field",              _interp("awk '{print $2}'"), "awk '{print $2}'");
+    _check_str("bare $ at end",          _interp("cost: 5$"), "cost: 5$");
+    _check_str("unclosed brace",         _interp("${UNSET"), "${UNSET");
+    _check_str("empty braces",           _interp("${}"), "${}");
+    // A declared name mixed with a shell one: only ours goes.
+    _check_str("mixed",                  _interp("$DIR/$HOME"), "build/$HOME");
+}
+
+fn main() as i32 {
+    _p("=== caustic-mk unit suite (tests/run_tests.cst) ===\n");
+    io.mkdir("tests/tmp");
+
+    t_glob_match();
+    t_paths();
+    t_str_cmp();
+    t_hash();
+    t_sh_quote();
+    t_display_cmd();
+    t_write_if_changed();
+    t_glob_expand();
+    t_interpolate();
+
+    _p("\n=== ");
+    if (_fail == 0) { _p("ALL PASSED"); } else { _p("FAILED"); }
+    _p(" === pass=");
+    io.write_int(io.STDOUT, cast(i64, _pass));
+    _p(" fail=");
+    io.write_int(io.STDOUT, cast(i64, _fail));
+    _p("\n");
+    if (_fail == 0) { return 0; }
+    return 1;
+}

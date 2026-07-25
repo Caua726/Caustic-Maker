@@ -1,0 +1,9 @@
+name "profile-cache"
+
+profile "release" { flags "-O2" }
+profile "debug"   { flags "-O0" }
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+}

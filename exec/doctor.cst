@@ -1,0 +1,331 @@
+use "../../std/io.cst" as io;
+use "../../std/os.cst" as os;
+use "../../std/env.cst" as env;
+use "../core/common.cst" as c;
+use "../core/sysutil.cst" as sys;
+use "../parser/parser.cst" as parser;
+
+// ── `doctor` and `completions` ────────────────────────────────
+//
+// `doctor` answers the questions that otherwise cost a failed build to discover:
+// WHICH caustic am I about to run and why that one, does every file the manifest
+// names actually exist, can I write the cache, is git here if the manifest needs
+// it. All of it is knowable before the first compile, and each one has been the
+// real cause of a confusing error at some point:
+//
+//   • a sibling project silently picking up an installed compiler instead of the
+//     one in the working tree (or the other way round);
+//   • a mistyped `src` that only failed inside the compiler, with no target name
+//     anywhere in the message;
+//   • a `depend` in a manifest on a machine without git.
+//
+// Output follows the repo's tools/*.sh: ▸ section, ✓ fine, ✗ broken, ∼ worth
+// knowing. The exit code counts only the ✗ lines, so it can gate a script.
+
+let is i32 as _bad with mut = 0;
+let is i32 as _warn with mut = 0;
+
+fn _step(s as *u8) as void {
+    c.print("\n");
+    c.print(s);
+    c.write_nl(1);
+}
+
+fn _ok(label as *u8, detail as *u8) as void {
+    c.print("  ok    ");
+    c.print(label);
+    if (c.strlen(detail) > 0) { c.print("  "); c.print(detail); }
+    c.write_nl(1);
+}
+
+fn _fail(label as *u8, detail as *u8) as void {
+    _bad = _bad + 1;
+    c.print("  FAIL  ");
+    c.print(label);
+    if (c.strlen(detail) > 0) { c.print("  "); c.print(detail); }
+    c.write_nl(1);
+}
+
+fn _note(label as *u8, detail as *u8) as void {
+    _warn = _warn + 1;
+    c.print("  warn  ");
+    c.print(label);
+    if (c.strlen(detail) > 0) { c.print("  "); c.print(detail); }
+    c.write_nl(1);
+}
+
+// Which rule produced this tool path? The order is
+// `toolchain` -> ./ -> $CAUSTIC_DIR -> the directory holding caustic-mk -> PATH,
+// and knowing which one fired is the difference between "wrong compiler" being
+// obvious and being a two-hour hunt.
+fn _origin_of(proj as *parser.Project, path as *u8, name as *u8) as *u8 {
+    if (proj.toolchain_len > 0) {
+        let is *u8 as dir = c.str_dup(proj.toolchain_ptr, proj.toolchain_len);
+        if (c.starts_with(path, dir) == 1) { return "from the Causticfile's `toolchain`"; }
+    }
+    if (c.starts_with(path, "./") == 1) { return "from the working directory"; }
+    let is *u8 as cd with mut = env.getenv("CAUSTIC_DIR");
+    if (cast(i64, cd) == 0) { cd = ""; }
+    if (c.strlen(cd) > 0 && c.starts_with(path, cd) == 1) { return "from $CAUSTIC_DIR"; }
+    let is *u8 as sd = sys.self_dir();
+    if (c.strlen(sd) > 0 && c.starts_with(path, sd) == 1) { return "from caustic-mk's own directory"; }
+    if (c.streq_lit(path, name) == 1) { return "from PATH"; }
+    return "";
+}
+
+fn _check_tool(proj as *parser.Project, name as *u8) as void {
+    let is *u8 as path = sys.find_tool(name);
+    let is *u8 as origin = _origin_of(proj, path, name);
+    let is *u8 as detail with mut = path;
+    if (c.strlen(origin) > 0) { detail = c.str_cat4(path, "  (", origin, ")"); }
+    // A bare name means discovery fell through to PATH; whether that resolves is
+    // the shell's business, so report it rather than claiming either way.
+    if (c.streq_lit(path, name) == 1) {
+        _note(name, c.str_cat(detail, " — not found in any known directory"));
+        return;
+    }
+    if (sys.file_exists(path) == 0) {
+        _fail(name, c.str_cat(detail, " — does not exist"));
+        return;
+    }
+    _ok(name, detail);
+}
+
+// Does every path the manifest names exist? A missing `src` used to surface as a
+// compiler error with no target name in it.
+fn _check_inputs(proj as *parser.Project) as void {
+    let is i32 as missing with mut = 0;
+    let is i32 as checked with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+        if (t.src_len > 0) {
+            let is *u8 as srcp = c.str_dup(t.src_ptr, t.src_len);
+            checked = checked + 1;
+            if (sys.file_exists(srcp) == 0) {
+                _fail(c.str_cat3(tname, ": src ", srcp), "no such file");
+                missing = missing + 1;
+            }
+        }
+        let is *parser.Input as inp with mut = cast(*parser.Input, t.inputs);
+        while (cast(i64, inp) != 0) {
+            let is *u8 as p = c.str_dup(inp.path_ptr, inp.path_len);
+            checked = checked + 1;
+            if (sys.file_exists(p) == 0) {
+                _fail(c.str_cat3(tname, ": input ", p), "no such file");
+                missing = missing + 1;
+            }
+            inp = cast(*parser.Input, inp.next);
+        }
+        i = i + 1;
+    }
+    if (missing == 0) {
+        _ok(c.str_cat3(c.u64_to_str(cast(i64, checked)), " declared input", ""),
+            "all present");
+    }
+}
+
+// Every `depends` and every hook has to name something that exists, or the
+// failure only shows up when that particular target is built.
+fn _check_references(proj as *parser.Project) as void {
+    let is i32 as broken with mut = 0;
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tname = c.str_dup(t.name_ptr, t.name_len);
+        let is *parser.Name as dn with mut = cast(*parser.Name, t.depends);
+        while (cast(i64, dn) != 0) {
+            let is *u8 as d = c.str_dup(dn.ptr, dn.len);
+            if (cast(i64, sys.find_target(proj, d)) == 0) {
+                _fail(c.str_cat3(tname, ": depends ", d), "no such target");
+                broken = broken + 1;
+            }
+            dn = cast(*parser.Name, dn.next);
+        }
+        let is *parser.Name as bn with mut = cast(*parser.Name, t.before);
+        while (cast(i64, bn) != 0) {
+            let is *u8 as b = c.str_dup(bn.ptr, bn.len);
+            if (cast(i64, sys.find_script(proj, b)) == 0) {
+                _fail(c.str_cat3(tname, ": before ", b), "no such script");
+                broken = broken + 1;
+            }
+            bn = cast(*parser.Name, bn.next);
+        }
+        let is *parser.Name as an with mut = cast(*parser.Name, t.after);
+        while (cast(i64, an) != 0) {
+            let is *u8 as a = c.str_dup(an.ptr, an.len);
+            if (cast(i64, sys.find_script(proj, a)) == 0) {
+                _fail(c.str_cat3(tname, ": after ", a), "no such script");
+                broken = broken + 1;
+            }
+            an = cast(*parser.Name, an.next);
+        }
+        i = i + 1;
+    }
+    if (proj.default_len > 0) {
+        let is *u8 as d = c.str_dup(proj.default_ptr, proj.default_len);
+        if (cast(i64, sys.find_target(proj, d)) == 0) {
+            _fail(c.str_cat("default ", d), "no such target");
+            broken = broken + 1;
+        }
+    }
+    if (broken == 0) { _ok("depends / before / after / default", "every reference resolves"); }
+}
+
+fn exec_doctor(proj as *parser.Project) as i32 {
+    _bad = 0;
+    _warn = 0;
+    c.print("caustic-mk doctor");
+    c.write_nl(1);
+
+    _step("host");
+    if (os.current() == os.OS_LINUX) { _ok("os", "linux"); }
+    else if (os.current() == os.OS_WINDOWS) {
+        _ok("os", "windows");
+        // Both are real, documented gaps, and both are silent until they bite.
+        _note("globs", "`source`/`asm`/`obj` wildcards need a Linux host (std/io.list_dir has no Windows backend)");
+        _note("manifest discovery", "no chdir binding on Windows — run caustic-mk from the project root");
+    } else { _note("os", "unrecognised"); }
+
+    _step("toolchain");
+    if (proj.toolchain_len > 0) {
+        _ok("toolchain key", c.str_dup(proj.toolchain_ptr, proj.toolchain_len));
+    }
+    _check_tool(proj, "caustic");
+    _check_tool(proj, "caustic-as");
+    _check_tool(proj, "caustic-ld");
+
+    _step("manifest");
+    _ok("Causticfile", sys.manifest_path());
+    if (proj.name_len == 0) { _note("name", "the project has no `name`"); }
+    if (proj.version_len == 0) { _note("version", "no `version`, so nothing is embedded as --app-version"); }
+    if (proj.target_count == 0) { _note("targets", "the manifest declares none"); }
+    else {
+        _ok(c.str_cat(c.u64_to_str(cast(i64, proj.target_count)), " targets"),
+            c.str_cat(c.u64_to_str(cast(i64, proj.script_count)), " scripts"));
+    }
+    _check_references(proj);
+    _check_inputs(proj);
+
+    _step("cache");
+    let is *u8 as cdir = sys.cache_dir();
+    sys.mkdir_p(cdir);
+    let is *u8 as probe = c.path_join(cdir, ".doctor-probe");
+    c.write_small_file(probe, "x", 1);
+    if (sys.file_exists(probe) == 1) {
+        io.unlink(probe);
+        _ok("writable", cdir);
+    } else {
+        _fail("not writable", cdir);
+    }
+
+    // git is only required when something actually needs cloning.
+    if (cast(i64, proj.deps) != 0) {
+        _step("dependencies");
+        if (sys.run_cmd(c.str_cat3("git --version ", sys.silent_suffix(), "")) == 0) {
+            _ok("git", "available");
+        } else {
+            _fail("git", "the manifest has `depend` entries and git is not usable");
+        }
+    }
+
+    c.print("\n");
+    if (_bad == 0 && _warn == 0) {
+        c.print("all good");
+        c.write_nl(1);
+        return 0;
+    }
+    c.print(c.u64_to_str(cast(i64, _bad)));
+    c.print(" problem(s), ");
+    c.print(c.u64_to_str(cast(i64, _warn)));
+    c.print(" note(s)");
+    c.write_nl(1);
+    if (_bad > 0) { return 1; }
+    return 0;
+}
+
+// ── completions ──────────────────────────────────────────────
+// Emitted rather than shipped as a static file so the target and script names
+// come from the CURRENT manifest — the half of the command line that a generic
+// completion script can never know.
+
+let is *u8 as _COMMANDS with imut = "build run test list info why graph watch install clean init doctor completions help version";
+let is *u8 as _FLAGS with imut = "-j --parallel --incremental --continue --force --cache --dot --no-deps -n --dry-run -q --quiet -v --verbose --time --prefix --interval --profile --define --target= --help --version";
+
+fn _names_of(proj as *parser.Project) as *u8 {
+    let is *u8 as out with mut = c.str_dup("", 0);
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        out = c.str_cat3(out, " ", c.str_dup(t.name_ptr, t.name_len));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < proj.script_count) {
+        let is *parser.Script as s = parser.get_script(proj, i);
+        out = c.str_cat3(out, " ", c.str_dup(s.name_ptr, s.name_len));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn exec_completions(proj as *parser.Project, shell as *u8) as i32 {
+    let is *u8 as names = _names_of(proj);
+    if (c.streq_lit(shell, "bash") == 1) {
+        c.print("# caustic-mk bash completion — generated by `caustic-mk completions bash`\n");
+        c.print("# install:  caustic-mk completions bash > ~/.local/share/bash-completion/completions/caustic-mk\n");
+        c.print("_caustic_mk() {\n");
+        c.print("    local cur prev\n");
+        c.print("    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
+        c.print("    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n");
+        c.print("    if [ \"$COMP_CWORD\" -eq 1 ]; then\n");
+        c.print("        COMPREPLY=( $(compgen -W \"");
+        c.print(_COMMANDS);
+        c.print("\" -- \"$cur\") )\n");
+        c.print("        return\n");
+        c.print("    fi\n");
+        c.print("    case \"$cur\" in\n");
+        c.print("        -*) COMPREPLY=( $(compgen -W \"");
+        c.print(_FLAGS);
+        c.print("\" -- \"$cur\") ); return ;;\n");
+        c.print("    esac\n");
+        c.print("    COMPREPLY=( $(compgen -W \"all");
+        c.print(names);
+        c.print("\" -- \"$cur\") )\n");
+        c.print("}\n");
+        c.print("complete -F _caustic_mk caustic-mk\n");
+        return 0;
+    }
+    if (c.streq_lit(shell, "zsh") == 1) {
+        c.print("#compdef caustic-mk\n");
+        c.print("# caustic-mk zsh completion — generated by `caustic-mk completions zsh`\n");
+        c.print("# install:  caustic-mk completions zsh > \"${fpath[1]}/_caustic-mk\"\n");
+        c.print("_caustic_mk() {\n");
+        c.print("    local -a cmds names flags\n");
+        c.print("    cmds=(");
+        c.print(_COMMANDS);
+        c.print(")\n");
+        c.print("    names=(all");
+        c.print(names);
+        c.print(")\n");
+        c.print("    flags=(");
+        c.print(_FLAGS);
+        c.print(")\n");
+        c.print("    if (( CURRENT == 2 )); then\n");
+        c.print("        compadd -a cmds\n");
+        c.print("    elif [[ $words[CURRENT] == -* ]]; then\n");
+        c.print("        compadd -a flags\n");
+        c.print("    else\n");
+        c.print("        compadd -a names\n");
+        c.print("    fi\n");
+        c.print("}\n");
+        c.print("_caustic_mk \"$@\"\n");
+        return 0;
+    }
+    c.eprint("error: unknown shell '");
+    c.eprint(shell);
+    c.eprint("' — expected 'bash' or 'zsh'");
+    c.write_nl(2);
+    return 1;
+}

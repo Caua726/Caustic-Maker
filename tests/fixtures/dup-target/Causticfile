@@ -1,0 +1,11 @@
+name "dup-target"
+
+target "shell" {
+    src "a.cst"
+    out "build/a"
+}
+
+target "shell" {
+    src "b.cst"
+    out "build/b"
+}

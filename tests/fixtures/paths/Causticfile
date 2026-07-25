@@ -1,0 +1,16 @@
+name "paths"
+
+# One-shot: the compiler links the single object itself.
+target "oneshot" {
+    src "main.cst"
+    out "build/oneshot"
+}
+
+# Staged: an extra `source` forces compile -> assemble -> link as three steps,
+# which is a different code path in the maker (and the only one a kernel can
+# use, because the one-shot mode links exactly one object).
+target "staged" {
+    src "main.cst"
+    out "build/staged"
+    source "extra.cst"
+}

@@ -1,0 +1,4 @@
+use "a/m.cst" as am;
+use "b/m.cst" as bm;
+
+fn main() as i32 { return am.v() + bm.v(); }

@@ -1,0 +1,18 @@
+name "hooks"
+
+target "good" {
+    src "main.cst"
+    out "build/good"
+    before "say-before"
+    after "say-after"
+}
+
+target "bad" {
+    src "broken.cst"
+    out "build/bad"
+    before "say-before"
+    after "say-after"
+}
+
+script "say-before" { "echo HOOK_BEFORE" }
+script "say-after"  { "echo HOOK_AFTER" }

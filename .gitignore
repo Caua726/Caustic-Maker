@@ -1,5 +1,20 @@
 # generated build artifacts
-version.cst
+# NOTE: version.cst is deliberately NOT here. It is what `caustic-mk --version`
+# reports and what `version_file` keeps in sync, so a clean clone has to carry
+# it — exactly like the parent repo's src/version.cst. It used to be ignored
+# because an older build step generated it into the source tree unasked.
 *.cst.s
 *.cst.s.o
 .caustic/
+
+# the maker builds itself here
+/caustic-mk
+/caustic-mk.exe
+# CodeView debug data, written beside a windows-x86_64 build
+*.pdb
+
+# test scratch. integration.sh works on copies in $TMPDIR, so a clean checkout
+# never grows these — they only appear when a fixture is run in place by hand.
+tests/tmp/
+tests/fixtures/*/build/
+tests/fixtures/*/dist/

@@ -1,0 +1,12 @@
+name "dep-fail"
+
+target "base" {
+    src "broken.cst"
+    out "build/base"
+}
+
+target "app" {
+    src "ok.cst"
+    out "build/app"
+    depends "base"
+}

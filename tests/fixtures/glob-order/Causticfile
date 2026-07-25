@@ -1,0 +1,7 @@
+name "glob-order"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    source "mods/*.cst"
+}

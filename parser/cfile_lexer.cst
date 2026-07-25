@@ -7,6 +7,7 @@ let is i32 as TK_STRING with imut = 2;
 let is i32 as TK_LBRACE with imut = 3;
 let is i32 as TK_RBRACE with imut = 4;
 let is i32 as TK_EOF with imut = 5;
+let is i32 as TK_EQEQ with imut = 6;   // `==`, only in a `when` condition
 
 struct Token {
     kind as i32;
@@ -51,6 +52,8 @@ fn lexer_restore(s as *LexState) as void {
     _pos = s.pos;
     _fname = s.fname;
 }
+
+fn lexer_pos() as i64 { return _pos; }
 
 fn lexer_file() as *u8 {
     if (cast(i64, _fname) == 0) { return "Causticfile"; }
@@ -181,6 +184,18 @@ fn next_token() as Token {
         tok.len = 1;
         _pos = _pos + 1;
         return tok;
+    }
+    // `==`, the only operator in the language, and only in `when x == "v"`. A
+    // lone `=` is rejected here rather than surfacing later as a mystery token.
+    if (ch == 61) {
+        if (_pos + 1 < _src_len && _src[_pos + 1] == 61) {
+            tok.kind = TK_EQEQ;
+            tok.ptr = cast(*u8, cast(i64, _src) + _pos);
+            tok.len = 2;
+            _pos = _pos + 2;
+            return tok;
+        }
+        error_at(_pos, "stray '=' (did you mean '==', in a `when` condition?)");
     }
     if (ch == 34) {
         // String literal. Backslash escapes \" \\ \n \t are honoured, so a

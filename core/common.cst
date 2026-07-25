@@ -1,5 +1,8 @@
 use "../../std/io.cst" as io;
 use "../../std/mem.cst" as mem;
+// Only for os.current(), which folds to a literal at compile time — the path
+// helpers below have to know whether a drive letter roots a path.
+use "../../std/os.cst" as os;
 
 // === Shared heap ===
 // One bins allocator for the whole maker. Previously each of main/parser/
@@ -266,12 +269,40 @@ fn path_dirname(path as *u8) as *u8 {
     return str_dup(path, cast(i32, cut));
 }
 
+// Is this path absolute? Split in two so both answers are reachable — and
+// therefore testable — from either host, with one OS-aware dispatcher on top.
+//
+// It matters that these disagree: on Linux `C:\x` is an ordinary relative file
+// name and prefixing it with the cwd is correct; on Windows the same string is
+// rooted and prefixing it produces a path that cannot exist.
+
+fn path_is_absolute_posix(p as *u8) as i32 {
+    if (p[0] == 47) { return 1; }                       // '/'
+    return 0;
+}
+
+fn path_is_absolute_win(p as *u8) as i32 {
+    if (p[0] == 47 || p[0] == 92) { return 1; }         // '/' or '\' — root of the current drive
+    // A drive-qualified path is absolute only with a separator after the colon:
+    // "C:\x" and "C:/x" are, bare "C:" and drive-relative "C:x" are not.
+    if (p[0] == 0 || p[1] != 58) { return 0; }          // ':'
+    if (p[2] != 47 && p[2] != 92) { return 0; }
+    if (p[0] >= 65 && p[0] <= 90) { return 1; }         // 'A'..'Z'
+    if (p[0] >= 97 && p[0] <= 122) { return 1; }        // 'a'..'z'
+    return 0;
+}
+
+fn path_is_absolute(p as *u8) as i32 {
+    if (os.current() == os.OS_WINDOWS) { return path_is_absolute_win(p); }
+    return path_is_absolute_posix(p);
+}
+
 // Join two path fragments with a single '/'. An empty or absolute `b` wins.
 fn path_join(a as *u8, b as *u8) as *u8 {
     if (strlen(a) == 0) { return str_cat("", b); }
     if (strlen(b) == 0) { return str_cat("", a); }
-    if (b[0] == 47) { return str_cat("", b); }
-    if (ends_with(a, "/") == 1) { return str_cat(a, b); }
+    if (path_is_absolute(b) == 1) { return str_cat("", b); }
+    if (ends_with(a, "/") == 1 || ends_with(a, "\\") == 1) { return str_cat(a, b); }
     return str_cat3(a, "/", b);
 }
 
@@ -343,13 +374,47 @@ fn write_small_file(path as *u8, data as *u8, data_len as i32) as void {
 // Leaving an identical file untouched keeps its mtime, which matters because
 // every generated file is an input to the up-to-date check — rewriting it byte
 // for byte would invalidate the target on every single build.
+//
+// The comparison reads the WHOLE file. It used to go through read_small_file,
+// which reads at most 511 bytes: for anything larger the lengths could never
+// match, so the function rewrote every time and defeated the one thing it is
+// for. Only `version_file` uses it today (43 bytes), so the damage was latent —
+// but it is the same truncated-read bug that was removed from deps.cst.
 fn write_if_changed(path as *u8, data as *u8, data_len as i32) as i32 {
-    let is i64 as old_len with mut = 0;
-    let is *u8 as old = read_small_file(path, &old_len);
-    if (cast(i64, old) != 0 && old_len == cast(i64, data_len)) {
-        if (streq_n(old, old_len, data, data_len) == 1) { return 0; }
+    if (io.exists(path) == 1) {
+        let is i64 as old_len = read_file_size(path);
+        if (old_len == cast(i64, data_len)) {
+            if (data_len == 0) { return 0; }        // both empty: nothing to do
+            let is *u8 as old = read_file(path);
+            if (cast(i64, old) != 0) {
+                let is i32 as same = streq_n(old, old_len, data, data_len);
+                big_free(old, old_len + 1);
+                if (same == 1) { return 0; }
+            }
+        }
     }
     write_small_file(path, data, data_len);
+    return 1;
+}
+
+// === Numbers ===
+
+// Parse a decimal integer, strictly: the whole string must be digits, and there
+// must be at least one. Returns 1 on success and writes *out, 0 on rejection.
+//
+// The lax version this replaces stopped at the first non-digit and returned
+// whatever it had, so `-j abc` parsed as 0 and silently meant "auto-detect" —
+// the same silent-acceptance bug as the ignored unknown flag.
+fn parse_int_strict(s as *u8, out as *i64) as i32 {
+    if (s[0] == 0) { return 0; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) {
+        if (s[i] < 48 || s[i] > 57) { return 0; }
+        v = v * 10 + (cast(i64, s[i]) - 48);
+        i = i + 1;
+    }
+    *out = v;
     return 1;
 }
 
@@ -422,7 +487,15 @@ fn glob_get(idx as i32) as *u8 {
     return cast(*u8, arr[idx]);
 }
 
-// Expand `pattern` into the module table; returns how many paths matched.
+// Expand `pattern` into the module table.
+//
+// Returns the number of matches, 0 when the pattern matched nothing, and **-1
+// when the directory could not be listed at all** — a missing directory, or any
+// Windows host, where std/io.list_dir has no backend and returns -1. Collapsing
+// that into 0 made every Windows glob fail with "pattern matched nothing",
+// which sends you looking at your own file names instead of at the missing
+// capability.
+//
 // A pattern with no wildcard yields itself (existence is the caller's business,
 // so a plain path behaves exactly as before). Matches come out sorted so the
 // link order of `asm "dir/*.s"` is stable across machines.
@@ -444,14 +517,19 @@ fn glob_expand(pattern as *u8) as i32 {
     let is i32 as cap with mut = 512;
     let is i32 as n with mut = 0;
     let is *u8 as ents with mut = cast(*u8, 0);
+    let is i64 as ents_size with mut = 0;
     while (1 == 1) {
-        ents = big_alloc(cast(i64, cap) * sizeof(io.DirEntry));
+        ents_size = cast(i64, cap) * sizeof(io.DirEntry);
+        ents = big_alloc(ents_size);
         n = io.list_dir(listdir, cast(*io.DirEntry, ents), cap);
         if (n < cap) { break; }
-        big_free(ents, cast(i64, cap) * sizeof(io.DirEntry));
+        big_free(ents, ents_size);
         cap = cap * 2;
     }
-    if (n <= 0) { return 0; }
+    if (n < 0) {
+        big_free(ents, ents_size);
+        return cast(i32, 0 - 1);            // could not list the directory
+    }
 
     let is i32 as i with mut = 0;
     while (i < n) {
@@ -460,6 +538,9 @@ fn glob_expand(pattern as *u8) as i32 {
         if (glob_match(base, nm) == 1) { _glob_push(path_join(dir, nm)); }
         i = i + 1;
     }
+    // The names were copied out above, so the entry table can go. It used to be
+    // leaked on this path — only the retry branch freed it.
+    big_free(ents, ents_size);
 
     // insertion sort by full path
     let is *i64 as arr = cast(*i64, _glob_ptrs);
@@ -523,6 +604,53 @@ fn u64_to_str(n as i64) as *u8 {
     while (j < slen) { out[j] = buf[start + j]; j = j + 1; }
     out[slen] = cast(u8, 0);
     return out;
+}
+
+// Unix seconds -> "YYYY-MM-DD HH:MM:SS" (UTC). For `why`, where the whole point
+// is comparing two timestamps by eye — a raw epoch count cannot be read.
+//
+// Civil-from-days by the usual shift-the-year-to-March trick: with March as
+// month 0 the leap day lands at the end, so the month-length pattern is a plain
+// arithmetic progression and no table or branch on February is needed.
+fn fmt_unix_time(secs as i64) as *u8 {
+    if (secs <= 0) { return str_dup("(none)", 6); }
+    let is i64 as days with mut = secs / 86400;
+    let is i64 as rem with mut = secs % 86400;
+    if (rem < 0) { rem = rem + 86400; days = days - 1; }
+
+    let is i64 as z = days + 719468;               // shift epoch to 0000-03-01
+    let is i64 as era with mut = z / 146097;       // 400-year era
+    if (z < 0) { era = (z - 146096) / 146097; }
+    let is i64 as doe = z - era * 146097;                       // day of era
+    let is i64 as yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let is i64 as y with mut = yoe + era * 400;
+    let is i64 as doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let is i64 as mp = (5 * doy + 2) / 153;                     // March-based month
+    let is i64 as d = doy - (153 * mp + 2) / 5 + 1;
+    let is i64 as m with mut = mp + 3;
+    if (mp >= 10) { m = mp - 9; }
+    if (m <= 2) { y = y + 1; }
+
+    let is *u8 as out = galloc(20);
+    _two_digits(out, 0, y / 100);
+    _two_digits(out, 2, y % 100);
+    out[4] = cast(u8, 45);                                      // '-'
+    _two_digits(out, 5, m);
+    out[7] = cast(u8, 45);
+    _two_digits(out, 8, d);
+    out[10] = cast(u8, 32);                                     // ' '
+    _two_digits(out, 11, rem / 3600);
+    out[13] = cast(u8, 58);                                     // ':'
+    _two_digits(out, 14, (rem / 60) % 60);
+    out[16] = cast(u8, 58);
+    _two_digits(out, 17, rem % 60);
+    out[19] = cast(u8, 0);
+    return out;
+}
+
+fn _two_digits(buf as *u8, at as i64, v as i64) as void {
+    buf[at] = cast(u8, 48 + cast(i32, (v / 10) % 10));
+    buf[at + 1] = cast(u8, 48 + cast(i32, v % 10));
 }
 
 // Mangle a source path to the compiler's module prefix: "_" + path with

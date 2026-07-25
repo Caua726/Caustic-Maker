@@ -1,5 +1,11 @@
 # caustic-mk
 
+![version](https://img.shields.io/badge/version-0.2.0-blue)
+![language](https://img.shields.io/badge/written%20in-Caustic-orange)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![tests](https://img.shields.io/badge/tests-151%20unit%20%2B%20127%20black--box-success)
+![license](https://img.shields.io/badge/license-MIT-lightgrey)
+
 The build system for the Caustic toolchain, written entirely in Caustic.
 
 Reads a `Causticfile` and drives the Caustic compiler to build targets, run
@@ -7,14 +13,24 @@ scripts, and resolve dependencies — no `make`, `cmake`, `gcc`, or any external
 tool. The compiler carries its own assembler and linker, so a build never
 shells out to `as`/`ld` either.
 
+```bash
+caustic-mk build all -j 8     # everything, in parallel, skipping what is current
+caustic-mk why kernel         # why does it think that needs rebuilding?
+caustic-mk doctor             # which toolchain am I about to use, and is it usable?
+```
+
 ## Build
 
 Built by the toolchain itself (bootstrapped from an existing `caustic`):
 
 ```bash
-# From the repo root:
+# From the parent Caustic checkout:
 ./caustic-mk build caustic-mk    # builds ./caustic-mk
 ```
+
+`caustic-mk` lives inside a Caustic checkout — its sources `use "../../std/…"` —
+so building it needs the parent repo present, as with the assembler and the
+linker. See [Development](#development) for the test suites and the gate.
 
 ## Usage
 
@@ -24,13 +40,19 @@ Built by the toolchain itself (bootstrapped from an existing `caustic`):
 ./caustic-mk build all -j 8     # build 8 targets at once (default = CPU count)
 ./caustic-mk run <name>         # run a named script (or target)
 ./caustic-mk run <name> -- a b  # forward arguments ($1..$n / $@, or the binary's argv)
+./caustic-mk build              # build the project's `default` target
 ./caustic-mk test               # run the 'test' script
 ./caustic-mk list               # what this Causticfile declares
 ./caustic-mk info <target>      # the exact commands a build would run
+./caustic-mk why <target>       # why it is (or is not) up to date
+./caustic-mk graph [target]     # the dependency tree (--dot for graphviz)
+./caustic-mk doctor             # check the toolchain, the manifest and its inputs
 ./caustic-mk watch [target]     # rebuild whenever an input changes
 ./caustic-mk install [target]   # copy outputs to their install path / --prefix
-./caustic-mk clean              # remove build artifacts
+./caustic-mk clean [--cache]    # remove build artifacts (--cache: only the cache)
+./caustic-mk completions bash   # a completion script carrying this manifest's names
 ./caustic-mk init               # scaffold a new Causticfile
+./caustic-mk --version          # what this binary is
 ```
 
 Flags on `build`:
@@ -49,6 +71,9 @@ Flags on `build`:
 | `--time` | per-target and total wall clock |
 | `--prefix <dir>` | `install` destination root |
 | `--interval <ms>` | `watch` poll interval (default 400) |
+| `--define NAME=VALUE` | override a `set` from the command line (repeatable) |
+| `--cache` | on `clean`: drop the cache and keep the outputs |
+| `--dot` | on `graph`: graphviz instead of a tree |
 
 A `Causticfile` is looked for in the current directory and then in each parent,
 so the commands work from anywhere inside a project — as `git` does. (Linux
@@ -154,6 +179,9 @@ last and wins); single-valued settings take the narrowest declaration.
 | `env` / `env_default` | environment for every build step and script |
 | `include "path"` | merge another Causticfile |
 | `profile "name" { … }` | a named settings overlay, selected with `--profile` |
+| `set NAME "value"` | a variable, referenced as `$NAME` / `${NAME}` (see [Variables](#variables)) |
+| `default "target"` | what a bare `caustic-mk build` builds |
+| `when <os\|target> == "v" { … }` | a block that only applies when the condition holds |
 
 This is what makes a large project's manifest readable — 75 CausticOS programs
 share one line instead of repeating a triple 75 times:
@@ -171,6 +199,55 @@ target "echo"  { src "coreutils/echo.cst" out "build/echo.cse" }
 `PATH`. `./` comes before `$CAUSTIC_DIR` on purpose: a bootstrap build inside the
 compiler's own repo must use the binary in the working tree.
 
+### Variables
+
+`set NAME "value"` at the top level, referenced as `$NAME` or `${NAME}` in any
+string value — the way a manifest with many similar targets stops repeating
+itself:
+
+```
+set TRIPLE "caustic-x86_64"
+set OUTDIR "build/$TRIPLE"
+
+flags "--target=$TRIPLE"
+target "shell" { src "shell/shell.cst" out "$OUTDIR/shell.cse" }
+```
+
+`--define NAME=VALUE` overrides a `set` for one invocation, and `set` will not
+clobber it — so a single manifest serves a matrix:
+
+```bash
+caustic-mk build all --define TRIPLE=windows-x86_64
+```
+
+**Only names declared by `set` (or `--define`) are substituted. Every other `$`
+passes through untouched.** That is what keeps the feature from colliding with
+the two places `$` already means something to someone else: a script command
+runs through `/bin/sh`, where `$1`, `$@`, `$HOME` and the `$2` in
+`awk '{print $2}'` belong to the shell, and `flags "--path $CAUSTIC_DIR/std"`
+relies on the shell expanding an `env` variable at build time. Write `$$` where
+a declared name must *not* be substituted.
+
+### Conditional blocks
+
+```
+when os == "windows" { system "ws2_32" }
+when target == "caustic-x86_64" { extension "cse" }
+
+target "net" {
+    src "net.cst"
+    out "build/net"
+    when os == "linux"   { flags "-O2" }
+    when os == "windows" { flags "-O0" }
+}
+```
+
+Evaluated **while parsing**, at project and at target scope. The inactive arm is
+not skipped at build time — it never becomes part of the project at all, which is
+the manifest's version of the `os.current == os.OS_X` dispatch the language
+itself uses. `os` is the host running `caustic-mk`; `target` is the effective
+triple from `--target=`. The `==` may be omitted.
+
 ### Profiles
 
 ```
@@ -185,6 +262,30 @@ caustic-mk build caustic --profile release
 Each profile gets its own cache directory (`.caustic/release/`), so a release
 object can never satisfy a debug build. A profile accepts `flags`, `ldflags`,
 `asflags`, `mode`, `extension` and `out_dir`.
+
+### Asking questions instead of guessing
+
+```
+$ caustic-mk why caustic-mk
+caustic-mk: rebuild needed
+  out           caustic-mk  2026-07-25 18:22:15
+  newer         core/sysutil.cst  2026-07-25 18:31:02  [import closure]
+```
+
+`why` runs the same up-to-date check a build runs and reports the input that
+decided it — the question a bare "up to date" cannot answer. The kind in
+brackets says where it came from: `src`, `declared input`, `import closure`,
+`manifest` or `compiler`.
+
+`graph [target]` prints the dependency tree a build walks, marking groups and
+cycles; `--dot` emits graphviz instead.
+
+`doctor` checks what a build is about to depend on, before it costs a failure:
+which `caustic` / `caustic-as` / `caustic-ld` was found **and by which rule**
+(`toolchain`, `./`, `$CAUSTIC_DIR`, `caustic-mk`'s own directory, `PATH`), that
+every declared `src` / `source` / `asm` / `obj` exists, that every `depends` and
+hook names something real, that the cache is writable, and that `git` is present
+if the manifest has `depend` entries. It exits non-zero only on real problems.
 
 ### Cross-building
 
@@ -338,6 +439,22 @@ so the line stays a line; the command itself still receives the real bytes:
 campo2 = b
 ```
 
+### Command prefixes in a script
+
+Two modifiers, borrowed from make because that is the vocabulary people already
+have for exactly these needs:
+
+```
+script "tidy" {
+    "-rm -f stray.tmp"          // '-' — run it, ignore a non-zero exit
+    "@echo done"                // '@' — run it without echoing the line
+}
+```
+
+Both may be combined (`-@cmd`). Without them a script had no way to express
+either: one `rm -f` of a file that happened not to exist aborted the whole
+script, and every command was echoed whether or not it printed its own message.
+
 ### Dependencies
 
 ```
@@ -359,15 +476,76 @@ cache directory, and `out_dir`. `--dry-run` lists what would go.
 
 ## Architecture
 
-| File | Purpose |
-|------|---------|
-| `main.cst` | CLI entry point and command dispatch |
-| `parser/` | `Causticfile` lexer and parser |
-| `exec/build.cst` | Target building (invokes the compiler) |
-| `exec/deps.cst` | Dependency resolution |
-| `exec/scripts.cst` | Scripts and lifecycle (`run`, `test`, `list`, `install`, `clean`, `init`) |
-| `core/` | Shared helpers, subprocess/FS layer, single-heap runtime |
+| File | Lines | Purpose |
+|------|------:|---------|
+| `main.cst` | 474 | CLI entry point, option parsing, command dispatch |
+| `parser/cfile_lexer.cst` | 291 | `Causticfile` tokens and every diagnostic's `file:line:col` |
+| `parser/parser.cst` | 1442 | the manifest: keys, targets, scripts, profiles, variables, `when` |
+| `exec/build.cst` | 1650 | the three build paths, up-to-date check, object cache, `-j`, `why`, `graph` |
+| `exec/scripts.cst` | 419 | `run` / `test` / `list` / `install` / `clean` / `init` |
+| `exec/doctor.cst` | 331 | `doctor` and `completions` |
+| `exec/deps.cst` | 150 | git dependency resolution |
+| `core/common.cst` | 673 | strings, paths, globs, hashes, the shared heap |
+| `core/sysutil.cst` | 902 | subprocess, filesystem, toolchain discovery, output control |
+| `version.cst` | 2 | the version `--version` reports, kept in step by `version_file` |
+
+Roughly 6.3k lines of Caustic, plus 865 lines of tests and 641 of shell tooling.
+
+## Development
+
+```bash
+tools/install-hooks.sh        # once — installs the pre-commit gate
+tools/precommit.sh            # the whole gate, by hand
+caustic-mk test               # just the two suites
+tools/check-cross.sh          # opt-in: the Windows binary under wine
+tools/prerelease.sh           # version bookkeeping, before tagging
+```
+
+`tools/precommit.sh` is the gate the hook runs, and what it proves is specific:
+
+1. the compiler works at all;
+2. `caustic-mk` builds from source;
+3. **that maker builds the maker, twice, byte-identically** — a maker built by a
+   maker is the same binary, so its own build path is deterministic;
+4. **one-shot, staged and `--incremental` all produce a working program** — the
+   maker's three build paths, the analogue of the parent repo's `-O0/-O1/-O2`
+   differential;
+5. both suites pass;
+6. nothing was written into the working tree.
+
+The suites are two layers:
+
+- **`tests/run_tests.cst`** — 151 unit checks over the pure helpers in `core/`
+  and the manifest interpolator: the glob matcher, the path splitters (both
+  separators and drive letters), the comparator that gives the link its
+  determinism, the cache-key hashes, the shell quoter, the command echo,
+  `write_if_changed`, the date formatter, `parse_int_strict`.
+- **`tests/integration.sh`** — 127 black-box cases over
+  `tests/fixtures/<case>/Causticfile`, one per defect the maker has actually
+  shipped: dependency failure propagating through `--continue`, the object cache
+  distinguishing identical content at different paths, `run` not picking up a
+  binary from `PATH`, nested `out`, duplicate names, an unclosed brace, glob
+  order, profile cache separation, `install` composing with `--prefix`, hook
+  ordering, `--dry-run` touching nothing. Every case runs on a copy of its
+  fixture in `$TMPDIR`, so a build never writes into the repo.
+
+There is no CI service: the gate is a shell script and a git hook, which is how
+the parent repo does it too. On a machine with a global `core.hooksPath`,
+`tools/install-hooks.sh` will say so — a repo-local hook is shadowed by it — and
+offers `--dispatch` to add a delegating dispatcher rather than writing into a
+shared directory on its own.
+
+Conventions worth knowing before editing: grow a table **before** taking a
+pointer to an element, `cast(i32, 0 - 1)` for a `-1` returned as `i32`,
+`with mut` on anything assigned after its declaration, `c.big_alloc` rather than
+`galloc` for anything whose size follows the manifest (`mem.bins` caps one
+allocation at 64 KiB), `io.*` in preference to shelling out, and every manifest
+error carrying `Causticfile:line:col`. An OS guard must be the **whole**
+condition of its own `if` — written as `if (rc == 0 && os.current() == ...)` the
+compiler cannot dead-strip the branch, and the wrong platform's syscalls survive
+into the binary.
 
 ## License
 
-Part of the [Caustic](https://github.com/Caua726/Caustic) project.
+MIT — see [LICENSE](LICENSE). Part of the [Caustic](https://github.com/Caua726/Caustic)
+project, which is MIT throughout.

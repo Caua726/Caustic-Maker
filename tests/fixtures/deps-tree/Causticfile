@@ -1,0 +1,27 @@
+name "deps-tree"
+
+# What a bare `caustic-mk build` builds.
+default "app"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    depends "lib"
+}
+
+target "lib" {
+    src "lib.cst"
+    out "build/lib"
+    depends "base"
+}
+
+target "base" {
+    src "base.cst"
+    out "build/base"
+}
+
+# A group: only `depends`, no output of its own.
+target "everything" {
+    depends "app"
+    depends "base"
+}

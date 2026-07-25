@@ -1,0 +1,7 @@
+name "bad-env-key"
+env "MY-VAR" "x"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+}

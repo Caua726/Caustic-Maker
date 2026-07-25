@@ -8,16 +8,41 @@ use "../parser/parser.cst" as parser;
 // Run every command of a script in order, each with the project's + the
 // script's declared environment applied and `args` as its positional
 // parameters ($1..$n, $@ — real shell positionals on Linux).
+// Leading command modifiers, borrowed from make because that is the vocabulary
+// people already have for exactly these two needs:
+//
+//   "-cmd"   run it, ignore a non-zero exit  (a cleanup that may have nothing
+//            to clean is not a build failure)
+//   "@cmd"   run it without echoing the line (a command that prints its own
+//            message does not need ours above it)
+//
+// Both may be combined ("-@cmd" / "@-cmd"). Without them a script had no way to
+// express either: one `rm -f` of a file that happens not to exist aborted the
+// whole script, and every command was echoed unconditionally.
 fn run_script(proj as *parser.Project, scr as *parser.Script, args as *i64, argc as i64) as i32 {
     let is i32 as i with mut = 0;
     while (i < scr.cmd_count) {
         let is *parser.ScriptCmd as cmd = parser.get_script_cmd(scr, i);
-        let is *u8 as cmd_str = c.str_dup(cmd.ptr, cmd.len);
+        let is *u8 as raw = c.str_dup(cmd.ptr, cmd.len);
+
+        let is i64 as at with mut = 0;
+        let is i32 as ignore_fail with mut = 0;
+        let is i32 as silent with mut = 0;
+        while (raw[at] == 45 || raw[at] == 64) {          // '-' or '@'
+            if (raw[at] == 45) { ignore_fail = 1; } else { silent = 1; }
+            at = at + 1;
+        }
+        let is *u8 as cmd_str = cast(*u8, cast(i64, raw) + at);
+
+        let is i32 as saved = sys.verbosity();
+        if (silent == 1 && saved > sys.V_QUIET) { sys.set_verbosity(sys.V_QUIET); }
         let is i32 as rc = sys.run_cmd_env(cmd_str,
                                            cast(*parser.EnvVar, proj.env),
                                            cast(*parser.EnvVar, scr.env),
                                            args, argc);
-        if (rc != 0) {
+        sys.set_verbosity(saved);
+
+        if (rc != 0 && ignore_fail == 0) {
             return rc;
         }
         i = i + 1;
@@ -69,6 +94,8 @@ fn exec_run(proj as *parser.Project, name as *u8, args as *i64, argc as i64) as 
     c.eprint(name);
     c.eprint("' is not a script or target");
     c.write_nl(2);
+    // `run` takes either, so the suggestion has to consider both tables.
+    sys.suggest_name(proj, name);
     return 1;
 }
 
@@ -86,6 +113,25 @@ fn exec_test(proj as *parser.Project, args as *i64, argc as i64) as i32 {
 //
 // With a project parsed we can sweep precisely: walk the targets and remove
 // exactly what each one produces.
+// `clean --cache` — drop only the build cache and keep the outputs. The point is
+// throwing away a suspect cache without paying for a full rebuild of everything
+// else, which plain `clean` forces.
+fn exec_clean_cache() as i32 {
+    if (sys.verbosity() >= sys.V_NORMAL) {
+        c.print("cleaning cache: ");
+        c.print(sys.cache_dir());
+        c.write_nl(1);
+    }
+    if (sys.dry_run() == 1) {
+        c.print("  [dry] rm -r ");
+        c.print(sys.cache_dir());
+        c.write_nl(1);
+        return 0;
+    }
+    sys.remove_dir(sys.cache_dir());
+    return 0;
+}
+
 fn exec_clean_project(proj as *parser.Project) as i32 {
     if (sys.verbosity() >= sys.V_NORMAL) {
         c.print("cleaning");

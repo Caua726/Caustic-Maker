@@ -115,11 +115,26 @@ fn _compile_tail(t as *parser.Target, proj as *parser.Project) as *u8 {
     // Dependencies: the project's shared ones, then the target's own.
     cmd = c.str_cat(cmd, _dep_paths(proj.deps));
     cmd = c.str_cat(cmd, _dep_paths(t.deps));
-    // -q reaches the compiler too: it writes its progress to stderr, which we
-    // must not redirect (that is where real errors go), so the only way to keep
-    // a quiet build quiet is to ask it not to narrate.
-    if (sys.verbosity() <= sys.V_QUIET) { cmd = c.str_cat(cmd, " -q"); }
     return cmd;
+}
+
+// -q reaches the compiler too: it writes its progress to stderr, which we must
+// not redirect (that is where real errors go), so the only way to keep a quiet
+// build quiet is to ask it not to narrate.
+//
+// Kept OUT of _compile_tail on purpose. The tail is hashed into the object cache
+// key, and verbosity does not change a single byte of generated code — with -q in
+// there, running one build quiet and the next one loud threw away every cached
+// object and recompiled the whole module graph.
+fn _q_flag() as *u8 {
+    if (sys.verbosity() <= sys.V_QUIET) { return " -q"; }
+    return "";
+}
+
+// The compile tail as it goes on a `caustic` command line: semantic flags plus
+// the verbosity the user asked for.
+fn _compile_cmd_tail(t as *parser.Target, proj as *parser.Project) as *u8 {
+    return c.str_cat(_compile_tail(t, proj), _q_flag());
 }
 
 // " -l<name>" for every `system` lib (the Causticfile's and any pulled in from
@@ -141,7 +156,7 @@ fn _build_compile_cmd(t as *parser.Target, proj as *parser.Project, caustic_bin 
     let is *u8 as cmd with mut = c.str_cat3(caustic_bin, " ", src);
     cmd = c.str_cat3(cmd, " -o ", tmp_out);
     cmd = c.str_cat3(cmd, " --cache ", sys.cache_dir());
-    cmd = c.str_cat(cmd, _compile_tail(t, proj));
+    cmd = c.str_cat(cmd, _compile_cmd_tail(t, proj));
     cmd = c.str_cat(cmd, _sys_libs());
     return cmd;
 }
@@ -171,9 +186,44 @@ let is i32 as _force with mut = 0;
 
 fn set_force(v as i32) as void { _force = v; }
 
+// ── Why a target is (not) up to date ─────────────────────────
+// The up-to-date check already knows which input tipped the decision; it just
+// used to throw that away and report a bare "up to date" / rebuild. Keeping it
+// is what makes `caustic-mk why <target>` possible, and costs one assignment.
+
+let is *u8 as _why_file with mut;
+let is *u8 as _why_kind with mut;
+let is i64 as _why_mtime with mut = 0;
+let is i32 as _why_set with mut = 0;
+
+fn _why_reset() as void {
+    _why_set = 0;
+    _why_mtime = 0;
+    _why_file = "";
+    _why_kind = "";
+}
+
+fn _why_note(kind as *u8, path as *u8, m as i64) as void {
+    _why_kind = kind;
+    _why_file = path;
+    _why_mtime = m;
+    _why_set = 1;
+}
+
 fn _mtime_max(cur as i64, path as *u8) as i64 {
     let is i64 as m = io.mtime(path);
     if (m > cur) { return m; }
+    return cur;
+}
+
+// Same, recording which file produced the new maximum. Called only when it does,
+// so after the last call _why_* names the newest input seen.
+fn _mtime_max_why(cur as i64, path as *u8, kind as *u8) as i64 {
+    let is i64 as m = io.mtime(path);
+    if (m > cur) {
+        _why_note(kind, path, m);
+        return m;
+    }
     return cur;
 }
 
@@ -183,15 +233,15 @@ fn _mtime_max(cur as i64, path as *u8) as i64 {
 fn _declared_newest(t as *parser.Target, proj as *parser.Project, caustic_bin as *u8) as i64 {
     let is i64 as newest with mut = 0;
     if (t.src_len > 0) {
-        newest = _mtime_max(newest, sys.abs_path(c.str_dup(t.src_ptr, t.src_len)));
+        newest = _mtime_max_why(newest, sys.abs_path(c.str_dup(t.src_ptr, t.src_len)), "src");
     }
     let is *parser.Input as inp with mut = cast(*parser.Input, t.inputs);
     while (cast(i64, inp) != 0) {
-        newest = _mtime_max(newest, c.str_dup(inp.path_ptr, inp.path_len));
+        newest = _mtime_max_why(newest, c.str_dup(inp.path_ptr, inp.path_len), "declared input");
         inp = cast(*parser.Input, inp.next);
     }
-    newest = _mtime_max(newest, sys.manifest_path());
-    newest = _mtime_max(newest, caustic_bin);
+    newest = _mtime_max_why(newest, sys.manifest_path(), "manifest");
+    newest = _mtime_max_why(newest, caustic_bin, "compiler");
     return newest;
 }
 
@@ -210,19 +260,29 @@ fn _declared_newest(t as *parser.Target, proj as *parser.Project, caustic_bin as
 // anyway.
 fn _up_to_date(t as *parser.Target, proj as *parser.Project, out_path as *u8,
                caustic_bin as *u8, deps_file as *u8) as i32 {
+    _why_reset();
     if (_force == 1) { return 0; }
     if (sys.dry_run() == 1) { return 0; }
-    if (t.src_len == 0) { return 0; }
-    if (sys.file_exists(out_path) == 0) { return 0; }
+    if (t.src_len == 0) {
+        _why_note("no src", "", 0);
+        return 0;
+    }
+    if (sys.file_exists(out_path) == 0) {
+        _why_note("missing output", out_path, 0);
+        return 0;
+    }
     let is i64 as out_m = io.mtime(out_path);
-    if (out_m == 0) { return 0; }
+    if (out_m == 0) {
+        _why_note("missing output", out_path, 0);
+        return 0;
+    }
     if (_declared_newest(t, proj, caustic_bin) >= out_m) { return 0; }
 
     if (sys.file_exists(deps_file) == 0) {
         let is *u8 as src = sys.abs_path(c.str_dup(t.src_ptr, t.src_len));
         let is *u8 as ec with mut = c.str_cat3(caustic_bin, " ", src);
         ec = c.str_cat3(ec, " --emit-deps ", deps_file);
-        ec = c.str_cat(ec, _compile_tail(t, proj));
+        ec = c.str_cat(ec, _compile_cmd_tail(t, proj));
         ec = c.str_cat3(ec, " -q", sys.quiet_suffix());
         let is i32 as saved = sys.verbosity();
         sys.set_verbosity(sys.V_QUIET);      // bookkeeping, not a build step
@@ -242,10 +302,179 @@ fn _up_to_date(t as *parser.Target, proj as *parser.Project, out_path as *u8,
             let is *u8 as mp = c.str_dup(cast(*u8, cast(i64, buf) + start), len);
             let is i64 as mm = io.mtime(mp);
             // A module that vanished counts as changed, not as unchanged.
-            if (mm == 0 || mm >= out_m) { return 0; }
+            if (mm == 0 || mm >= out_m) {
+                if (mm == 0) { _why_note("vanished module", mp, 0); }
+                else { _why_note("import closure", mp, mm); }
+                return 0;
+            }
         }
     }
+    // Up to date. _why_* still holds the newest declared input, which is the
+    // useful thing to report: "nothing is newer than the output, and the closest
+    // was this".
     return 1;
+}
+
+// `why <target>` — the up-to-date decision, with the file that made it.
+//
+// Answers the question a bare "up to date" cannot: which input does the build
+// think changed. Runs the same check a build runs (including the --emit-deps
+// pass when the closure is not cached), so it can never disagree with one.
+fn exec_why(proj as *parser.Project, target_name as *u8) as i32 {
+    let is *parser.Target as t = sys.find_target(proj, target_name);
+    if (cast(i64, t) == 0) {
+        c.eprint("error: target '");
+        c.eprint(target_name);
+        c.eprint("' not found");
+        c.write_nl(2);
+        sys.suggest_target(proj, target_name);
+        return 1;
+    }
+    if (t.src_len == 0) {
+        c.print(target_name);
+        c.print(": a group (only `depends`) — nothing of its own to date\n");
+        return 0;
+    }
+    let is *u8 as out_path = sys.target_output_path(proj, t);
+    let is *u8 as caustic_bin = sys.find_tool("caustic");
+    let is *u8 as src = sys.abs_path(c.str_dup(t.src_ptr, t.src_len));
+    let is *u8 as deps_file = _deps_file_for(src);
+
+    // `why` must answer the real question, so --force and --dry-run cannot be
+    // allowed to short-circuit the check the way they do for a build.
+    let is i32 as saved_force = _force;
+    _force = 0;
+    let is i32 as utd = _up_to_date(t, proj, out_path, caustic_bin, deps_file);
+    _force = saved_force;
+
+    c.print(target_name);
+    if (utd == 1) { c.print(": up to date\n"); } else { c.print(": rebuild needed\n"); }
+    let is i64 as out_m = io.mtime(out_path);
+    _why_line("out", out_path, out_m, "");
+    // When the output simply is not there, a second line would repeat the first
+    // and add nothing.
+    if (out_m > 0 && _why_set == 1) {
+        let is *u8 as label with mut = "newer";
+        if (utd == 1) { label = "newest input"; }
+        _why_line(label, _why_file, _why_mtime, _why_kind);
+    }
+    if (utd == 1) { return 0; }
+    return 1;
+}
+
+// ── `graph` — the dependency tree ────────────────────────────
+// The shape a build actually walks: `depends`, in declaration order, depth
+// first. A cycle is marked in place instead of only surfacing as a build error
+// once you try to build it.
+
+fn _graph_tree(proj as *parser.Project, name as *u8, depth as i32) as void {
+    let is i32 as pad with mut = 0;
+    while (pad < depth) { c.print("  "); pad = pad + 1; }
+    if (depth > 0) { c.print("└─ "); }
+    c.print(name);
+    let is *parser.Target as t = sys.find_target(proj, name);
+    if (cast(i64, t) == 0) {
+        c.print("   [missing target]");
+        c.write_nl(1);
+        return;
+    }
+    if (t.visiting == 1) {
+        c.print("   [cycle]");
+        c.write_nl(1);
+        return;
+    }
+    if (t.src_len > 0) {
+        c.print("   ");
+        io._write_fd(io.STDOUT, t.src_ptr, cast(i64, t.src_len));
+        c.print(" -> ");
+        c.print(sys.target_output_path(proj, t));
+    } else {
+        c.print("   (group)");
+    }
+    c.write_nl(1);
+    t.visiting = 1;
+    let is *parser.Name as dn with mut = cast(*parser.Name, t.depends);
+    while (cast(i64, dn) != 0) {
+        _graph_tree(proj, c.str_dup(dn.ptr, dn.len), depth + 1);
+        dn = cast(*parser.Name, dn.next);
+    }
+    t.visiting = 0;
+}
+
+// Graphviz edges. Emitted for the whole project regardless of the starting
+// target, because a partial digraph is misleading in a way a partial tree is not.
+fn _graph_dot(proj as *parser.Project) as void {
+    c.print("digraph causticfile {\n");
+    c.print("  rankdir=LR;\n");
+    c.print("  node [shape=box];\n");
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        let is *u8 as tn = c.str_dup(t.name_ptr, t.name_len);
+        // A group has no output of its own; drawing it differently is the whole
+        // reason someone asks for the graph.
+        if (t.src_len == 0) {
+            c.print("  \""); c.print(tn); c.print("\" [style=dashed];\n");
+        }
+        let is *parser.Name as dn with mut = cast(*parser.Name, t.depends);
+        while (cast(i64, dn) != 0) {
+            c.print("  \""); c.print(tn); c.print("\" -> \"");
+            c.print(c.str_dup(dn.ptr, dn.len)); c.print("\";\n");
+            dn = cast(*parser.Name, dn.next);
+        }
+        i = i + 1;
+    }
+    c.print("}\n");
+}
+
+fn exec_graph(proj as *parser.Project, target_name as *u8, dot as i32) as i32 {
+    if (dot == 1) {
+        _graph_dot(proj);
+        return 0;
+    }
+    if (cast(i64, target_name) != 0) {
+        if (cast(i64, sys.find_target(proj, target_name)) == 0) {
+            c.eprint("error: target '");
+            c.eprint(target_name);
+            c.eprint("' not found");
+            c.write_nl(2);
+            sys.suggest_target(proj, target_name);
+            return 1;
+        }
+        _graph_tree(proj, target_name, 0);
+        return 0;
+    }
+    if (proj.target_count == 0) {
+        c.print("(no targets)\n");
+        return 0;
+    }
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *parser.Target as t = parser.get_target(proj, i);
+        _graph_tree(proj, c.str_dup(t.name_ptr, t.name_len), 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _why_line(label as *u8, path as *u8, m as i64, kind as *u8) as void {
+    c.print("  ");
+    c.print(label);
+    let is i64 as pad with mut = 14 - c.strlen(label);
+    while (pad > 0) { c.print(" "); pad = pad - 1; }
+    if (c.strlen(path) == 0) { c.print("(none)"); } else { c.print(path); }
+    if (m > 0) {
+        c.print("  ");
+        c.print(c.fmt_unix_time(m));
+    } else {
+        c.print("  (does not exist)");
+    }
+    if (c.strlen(kind) > 0) {
+        c.print("  [");
+        c.print(kind);
+        c.print("]");
+    }
+    c.write_nl(1);
 }
 
 fn _deps_file_for(src as *u8) as *u8 {
@@ -345,12 +574,18 @@ fn _forward_triple(t as *parser.Target, proj as *parser.Project, own_flags as *u
 }
 
 // caustic-as <path> <asflags> [--target=…]  ->  <path>.o
-fn _assemble(t as *parser.Target, proj as *parser.Project, as_bin as *u8, path as *u8) as i32 {
+// The assemble command for one file, without running it — so the serial and the
+// concurrent path cannot drift apart.
+fn _assemble_cmd(t as *parser.Target, proj as *parser.Project, as_bin as *u8, path as *u8) as *u8 {
     let is *u8 as asflags = parser.eff_asflags(t, proj);
     let is *u8 as cmd with mut = c.str_cat3(as_bin, " ", path);
     if (c.strlen(asflags) > 0) { cmd = c.str_cat3(cmd, " ", asflags); }
     cmd = c.str_cat(cmd, _forward_triple(t, proj, asflags));
-    let is i32 as rc = _run_step(t, proj, cmd);
+    return cmd;
+}
+
+fn _assemble(t as *parser.Target, proj as *parser.Project, as_bin as *u8, path as *u8) as i32 {
+    let is i32 as rc = _run_step(t, proj, _assemble_cmd(t, proj, as_bin, path));
     if (rc != 0) {
         c.eprint("error: assemble failed: ");
         c.eprint(path);
@@ -374,7 +609,7 @@ fn run_pipeline_staged(t as *parser.Target, proj as *parser.Project) as i32 {
     if (t.src_len > 0) {
         let is *u8 as cc with mut = c.str_cat3(caustic_bin, " -c ", src);
         cc = c.str_cat3(cc, " --cache ", sys.cache_dir());
-        cc = c.str_cat(cc, _compile_tail(t, proj));
+        cc = c.str_cat(cc, _compile_cmd_tail(t, proj));
         if (_run_step(t, proj, cc) != 0) {
             c.eprint("error: compile failed: ");
             c.eprint(src);
@@ -398,10 +633,116 @@ fn run_pipeline_staged(t as *parser.Target, proj as *parser.Project) as i32 {
 // Build (or just collect) every extra link input a target declares, in
 // declaration order, and return them as a " obj1 obj2 …" fragment. Null on
 // failure — the message is already printed.
+// ── Concurrent steps within one target ───────────────────────
+// `-j N` used to mean "N targets at once" only. Inside a target the steps ran
+// strictly one after another, even where they are independent: assembling three
+// hand-written `.s` files, or compiling N `source` modules, is N processes that
+// never need to see each other's output. A kernel with three `.s` inputs paid
+// three serial assembler startups for no reason.
+//
+// The pool is the same shape as the one `build all` uses: keep up to `workers`
+// children alive, reap with wait_any where the platform has it (Linux) and in
+// spawn order where it does not. A failure is remembered and reported after the
+// batch drains, so one bad file does not leave orphans running.
+//
+// Only ever handed lists whose members are genuinely independent — a compile and
+// the assemble of ITS output are two batches, never one.
+fn _run_batch(t as *parser.Target, proj as *parser.Project, cmds as *i64, n as i32) as i32 {
+    if (n <= 0) { return 0; }
+    if (n == 1) { return _run_step(t, proj, cast(*u8, cmds[0])); }
+    // A dry run has nothing to overlap: print in order and stop.
+    if (sys.dry_run() == 1) {
+        let is i32 as di with mut = 0;
+        while (di < n) {
+            sys.echo_cmd(cast(*u8, cmds[di]));
+            di = di + 1;
+        }
+        return 0;
+    }
+
+    let is i32 as workers with mut = sys.detect_jobs(n);
+    if (workers < 1) { workers = 1; }
+    let is *u8 as pid_buf = c.big_alloc(cast(i64, workers) * 8);
+    let is *i64 as pids = cast(*i64, pid_buf);
+    let is i32 as live with mut = 0;
+    let is i32 as next with mut = 0;
+    let is i32 as failed with mut = 0;
+
+    while (next < n || live > 0) {
+        while (live < workers && next < n && failed == 0) {
+            let is *u8 as cmd = _step_cmd(cast(*u8, cmds[next]));
+            sys.echo_cmd(cmd);
+            let is i64 as pid = sys.spawn_cmd_env(cmd, cast(*parser.EnvVar, proj.env),
+                                                 cast(*parser.EnvVar, t.env),
+                                                 cast(*i64, 0), 0);
+            if (pid < 0) {
+                c.eprint("error: spawn failed\n");
+                failed = 1;
+            } else {
+                pids[live] = pid;
+                live = live + 1;
+            }
+            next = next + 1;
+        }
+        if (live == 0) { break; }
+        let is i32 as rc with mut = 0;
+        let is i64 as done_pid = sys.wait_any(&rc);
+        let is i32 as slot with mut = cast(i32, 0 - 1);
+        if (done_pid > 0) {
+            let is i32 as si with mut = 0;
+            while (si < live) {
+                if (pids[si] == done_pid) { slot = si; si = live; }
+                si = si + 1;
+            }
+        }
+        // No wait-any on this platform (or it reaped a child that is not ours):
+        // fall back to reaping the oldest, which is correct but lets a slow first
+        // job idle the other slots.
+        if (slot < 0) {
+            slot = 0;
+            rc = sys.wait_pid_of(pids[0]);
+        }
+        if (rc != 0) { failed = 1; }
+        pids[slot] = pids[live - 1];
+        live = live - 1;
+    }
+
+    c.big_free(pid_buf, cast(i64, workers) * 8);
+    return failed;
+}
+
+// The quiet-redirect wrapper _run_step applies, factored out so the concurrent
+// path builds exactly the same command string as the serial one.
+fn _step_cmd(cmd as *u8) as *u8 {
+    if (sys.verbosity() <= sys.V_QUIET) { return c.str_cat(cmd, sys.quiet_suffix()); }
+    return cmd;
+}
+
+// Build every extra input into an object and return the link list.
+//
+// Two concurrent batches instead of 2N serial steps: all the `source` compiles,
+// then all the assembles (of those compiles' output plus every `asm` input). The
+// split is a real dependency — a module's .s has to exist before it is assembled
+// — and everything within a batch is independent.
+//
+// The returned list stays in DECLARATION ORDER regardless of what finished first.
+// Link order is part of a target's meaning (a kernel cares which object lands
+// where), so it can never follow scheduling.
 fn _extra_objects(t as *parser.Target, proj as *parser.Project, caustic_bin as *u8, as_bin as *u8) as *u8 {
+    if (t.input_count == 0) { return c.str_dup("", 0); }
+
+    let is i64 as slots = cast(i64, t.input_count) * 8;
+    let is *u8 as cbuf = c.big_alloc(slots);      // compile commands
+    let is *u8 as abuf = c.big_alloc(slots);      // assemble commands
+    let is *i64 as ccmds = cast(*i64, cbuf);
+    let is *i64 as acmds = cast(*i64, abuf);
+    let is i32 as nc with mut = 0;
+    let is i32 as na with mut = 0;
     let is *u8 as objs with mut = c.str_dup("", 0);
+    let is i32 as bad with mut = 0;
+
     let is *parser.Input as inp with mut = cast(*parser.Input, t.inputs);
-    while (cast(i64, inp) != 0) {
+    while (cast(i64, inp) != 0 && bad == 0) {
         // IN_SRC goes to the compiler, so it needs the absolute form for the
         // same reason the main source does. IN_ASM / IN_OBJ go to caustic-as and
         // caustic-ld, which do no module resolution — left as declared.
@@ -413,36 +754,49 @@ fn _extra_objects(t as *parser.Target, proj as *parser.Project, caustic_bin as *
             // into the main object — listing it here would duplicate symbols.
             let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", path);
             cc = c.str_cat(cc, " --cache .caustic");
-            cc = c.str_cat(cc, _compile_tail(t, proj));
-            if (_run_step(t, proj, cc) != 0) {
-                c.eprint("error: compile failed: ");
-                c.eprint(path);
-                c.write_nl(2);
-                return cast(*u8, 0);
-            }
+            cc = c.str_cat(cc, _compile_cmd_tail(t, proj));
+            ccmds[nc] = cast(i64, cc);
+            nc = nc + 1;
             let is *u8 as mod_s = c.str_cat(path, ".s");
-            if (_assemble(t, proj, as_bin, mod_s) != 0) { return cast(*u8, 0); }
+            acmds[na] = cast(i64, _assemble_cmd(t, proj, as_bin, mod_s));
+            na = na + 1;
             objs = c.str_cat3(objs, " ", c.str_cat(mod_s, ".o"));
         } else if (inp.kind == parser.IN_ASM) {
             if (sys.file_exists(path) == 0) {
                 c.eprint("error: asm input not found: ");
                 c.eprint(path);
                 c.write_nl(2);
-                return cast(*u8, 0);
+                bad = 1;
+            } else {
+                acmds[na] = cast(i64, _assemble_cmd(t, proj, as_bin, path));
+                na = na + 1;
+                objs = c.str_cat3(objs, " ", c.str_cat(path, ".o"));
             }
-            if (_assemble(t, proj, as_bin, path) != 0) { return cast(*u8, 0); }
-            objs = c.str_cat3(objs, " ", c.str_cat(path, ".o"));
         } else {
             if (sys.file_exists(path) == 0) {
                 c.eprint("error: obj input not found: ");
                 c.eprint(path);
                 c.write_nl(2);
-                return cast(*u8, 0);
+                bad = 1;
+            } else {
+                objs = c.str_cat3(objs, " ", path);
             }
-            objs = c.str_cat3(objs, " ", path);
         }
         inp = cast(*parser.Input, inp.next);
     }
+
+    if (bad == 0 && _run_batch(t, proj, ccmds, nc) != 0) {
+        c.eprint("error: compile failed for an extra `source` input\n");
+        bad = 1;
+    }
+    if (bad == 0 && _run_batch(t, proj, acmds, na) != 0) {
+        c.eprint("error: assemble failed for an extra input\n");
+        bad = 1;
+    }
+
+    c.big_free(cbuf, slots);
+    c.big_free(abuf, slots);
+    if (bad == 1) { return cast(*u8, 0); }
     return objs;
 }
 
@@ -504,6 +858,82 @@ fn _tool_id(caustic_bin as *u8) as i64 {
     let is i64 as m = io.mtime(caustic_bin);
     let is i64 as s = c.read_file_size(caustic_bin);
     return c.hash_mix(m, s);
+}
+
+// ── Object cache GC ──────────────────────────────────────────
+// Every edit to a module produces a new cache key, so the object built from the
+// PREVIOUS content is orphaned the moment it is superseded. Nothing ever removed
+// them: `.caustic/obj/` grew by one file per edit, forever, and the only remedy
+// was `clean`, which throws the whole cache away and forces a cold rebuild.
+//
+// The live set is exactly the keys this build linked, which the module loop
+// already computes — so the sweep costs one directory listing and no hashing.
+
+let is *u8 as _live_keys with mut;          // *i64 array
+let is i32 as _live_count with mut = 0;
+let is i32 as _live_cap with mut = 0;
+
+fn _live_reset() as void { _live_count = 0; }
+
+fn _live_add(h as i64) as void {
+    if (_live_count >= _live_cap) {
+        let is i32 as newcap with mut = _live_cap * 2;
+        if (newcap < 64) { newcap = 64; }
+        _live_keys = c.big_grow(_live_keys, cast(i64, _live_cap) * 8, cast(i64, newcap) * 8);
+        _live_cap = newcap;
+    }
+    let is *i64 as arr = cast(*i64, _live_keys);
+    arr[_live_count] = h;
+    _live_count = _live_count + 1;
+}
+
+fn _live_has(h as i64) as i32 {
+    let is *i64 as arr = cast(*i64, _live_keys);
+    let is i32 as i with mut = 0;
+    while (i < _live_count) {
+        if (arr[i] == h) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Remove every object in `obj_dir` whose key this build did not use. Returns how
+// many went. Only ever called after a SUCCESSFUL link, so a failed build never
+// costs you a warm cache.
+fn _gc_objects(obj_dir as *u8) as i32 {
+    if (sys.dry_run() == 1) { return 0; }
+    if (_live_count == 0) { return 0; }        // nothing linked: no ground truth
+    let is i32 as n = c.glob_expand(c.path_join(obj_dir, "*.o"));
+    if (n <= 0) { return 0; }
+    // Copy the paths out of the shared glob table before touching the disk: the
+    // table is reused by the next glob_expand anywhere in the process.
+    let is *u8 as paths = c.big_alloc(cast(i64, n) * 8);
+    let is *i64 as parr = cast(*i64, paths);
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        parr[i] = cast(i64, c.str_cat("", c.glob_get(i)));
+        i = i + 1;
+    }
+    let is i32 as removed with mut = 0;
+    i = 0;
+    while (i < n) {
+        let is *u8 as p = cast(*u8, parr[i]);
+        let is *u8 as base = sys.basename(p);
+        let is i64 as blen = c.strlen(base);
+        // "<key>.o" -> <key>. A name that is not a decimal key is left alone:
+        // the directory belongs to us, but guessing is not a reason to delete.
+        if (blen > 2) {
+            let is i64 as key with mut = 0;
+            if (c.parse_int_strict(c.str_dup(base, cast(i32, blen - 2)), &key) == 1) {
+                if (_live_has(key) == 0) {
+                    if (io.unlink(p) == 0) { removed = removed + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    c.big_free(paths, cast(i64, n) * 8);
+    return removed;
 }
 
 fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32 {
@@ -594,6 +1024,15 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     //    STAGE3_CSTI gates the whole `.csti` mechanism. With it off, this is the
     //    plain `--module-only` per-module build (each module re-analyzes its import
     //    closure — slower first build, but no `.csti` machinery).
+    //
+    //    DO NOT make this loop concurrent. Its order is the point: a module reads
+    //    its dependencies' `.csti`, which an EARLIER iteration wrote. Running two
+    //    modules at once lets a dependent start before its dependency's interface
+    //    exists — a race whose outcome is either a silent fallback to full
+    //    re-analysis or a hard failure, depending on timing. The parallelism for
+    //    the many-changed case belongs one level down, in the compiler's own
+    //    `--module-objects` batch mode below, which knows the dependency order.
+    //    (_run_batch is for genuinely independent steps: see _extra_objects.)
     let is i32 as STAGE3_CSTI with imut = 1;
 
     // Warm build that changed MANY modules (rare): one batch beats many
@@ -622,6 +1061,7 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     let is i32 as rebuilt with mut = 0;
     let is i32 as reused with mut = 0;
     let is i32 as ci with mut = 0;
+    _live_reset();
     while (ci < nmod) {
         let is *u8 as modpath = c.str_dup(cast(*u8, cast(i64, deps_buf) + mod_off[ci]), mod_len[ci]);
         let is i64 as h = _obj_key(modpath, tail, tool_id);
@@ -630,6 +1070,7 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
             c.eprint(modpath); c.write_nl(2);
             return 1;
         }
+        _live_add(h);
         let is *u8 as obj = c.path_join(obj_dir, c.str_cat(c.u64_to_str(h), ".o"));
         if (sys.file_exists(obj) == 0) {
             if (use_batch == 1) {
@@ -682,12 +1123,21 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
     let is i32 as lrc = _link_objects(t, proj, ld_bin, objs, auto_entry);
     if (lrc != 0) { return lrc; }
 
+    // 5. Drop the objects this build superseded. After the link, so a failure
+    //    never costs a warm cache.
+    let is i32 as swept = _gc_objects(obj_dir);
+
     if (sys.verbosity() < sys.V_NORMAL) { return 0; }
     c.print("incremental: ");
     c.print(c.u64_to_str(cast(i64, rebuilt)));
     c.print(" rebuilt, ");
     c.print(c.u64_to_str(cast(i64, reused)));
     c.print(" reused");
+    if (swept > 0) {
+        c.print(", ");
+        c.print(c.u64_to_str(cast(i64, swept)));
+        c.print(" stale objects removed");
+    }
     c.write_nl(1);
     return 0;
 }
@@ -699,6 +1149,7 @@ fn exec_build(proj as *parser.Project, target_name as *u8, continue_flag as i32,
         c.eprint(target_name);
         c.eprint("' not found");
         c.write_nl(2);
+        sys.suggest_target(proj, target_name);
         return 1;
     }
 

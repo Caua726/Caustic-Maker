@@ -1,0 +1,6 @@
+name "obj-cache"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+}

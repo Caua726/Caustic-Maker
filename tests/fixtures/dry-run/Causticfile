@@ -1,0 +1,6 @@
+name "dry-run"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+}

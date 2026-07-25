@@ -1,0 +1,24 @@
+name "prefixes"
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    depends "nothing-here"
+    after "no-such"
+}
+
+# make's vocabulary: '-' ignores a non-zero exit, '@' does not echo the line.
+script "ignore-fail" {
+    "-rm -f a-file-that-does-not-exist"
+    "-false"
+    "echo REACHED_END"
+}
+
+script "silent" {
+    "@echo QUIET_OUTPUT"
+}
+
+script "aborts" {
+    "false"
+    "echo SHOULD_NOT_PRINT"
+}

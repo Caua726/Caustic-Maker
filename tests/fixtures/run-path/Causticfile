@@ -1,0 +1,6 @@
+name "run-path"
+
+target "mkfixture" {
+    src "main.cst"
+    out "mkfixture"
+}

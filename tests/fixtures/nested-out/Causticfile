@@ -1,0 +1,6 @@
+name "nested-out"
+
+target "app" {
+    src "main.cst"
+    out "dist/bin/app"
+}

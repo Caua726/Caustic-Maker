@@ -1,0 +1,36 @@
+name "vars"
+
+# One declaration instead of repeating the triple in every target.
+set TRIPLE "caustic-x86_64"
+set OUTDIR "build/$TRIPLE"
+set NAME "app"
+
+target "app" {
+    src "main.cst"
+    out "$OUTDIR/${NAME}.bin"
+}
+
+# Parse-time dispatch: the inactive arm never becomes part of the project.
+when os == "linux" {
+    target "only-linux" { src "main.cst" out "build/lin" }
+}
+
+when os == "windows" {
+    target "only-windows" { src "main.cst" out "build/win" }
+}
+
+# Same subject inside a target.
+target "conditional" {
+    src "main.cst"
+    out "build/conditional"
+    when os == "linux" { flags "-O1" }
+    when os == "windows" { flags "-O0" }
+}
+
+script "show" {
+    "echo declared=$TRIPLE escaped=$$TRIPLE shell=$HOME arg=$1"
+}
+
+script "awktest" {
+    "printf 'a b c\n' | awk '{print \"field2 =\", $2}'"
+}
