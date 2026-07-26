@@ -23,6 +23,25 @@ Found while building and publishing the 0.2.0 artifacts.
     after the output it was given — the temp name — so every Windows build left a
     stray `<out>.tmp.pdb` and the `<out>.pdb` a debugger looks for never existed.
     It now follows the rename, and is removed when the build fails.
+19. **The universal bundle left one stray `.pdb` per PE sub-build.**
+    `--target=caustic --mode=compat` is orchestrated as several single-target
+    links, and each PE sub-build drops a `.pdb` in the current directory named
+    after its own temp output — `<out>.tmp.__cse_pe.tmp.pdb` and
+    `<out>.tmp.__cse_pea64.tmp.pdb`. They belong to intermediate files that no
+    longer exist, so nothing would ever read them and `clean` did not know their
+    names. Now swept by pattern, on success and on failure alike.
+
+### Added
+
+- **`profile "bundle"`** in the maker's own manifest: with the multi-architecture
+  triple, `caustic-mk build caustic-mk --target=caustic --profile bundle`
+  produces ONE file carrying a PE per architecture, two ELF bodies behind a
+  `uname -m` shell dispatcher, and a CST_ container with one CausticOS slice per
+  architecture — three operating systems and two architectures in a single
+  artifact. Verified by running the same file on Linux x86_64 (via the shell
+  dispatcher), under wine, and — extracting its aarch64 slice — under
+  `qemu-aarch64`.
+
 18. **`tools/prerelease.sh` compared against stale tags.** It read `git tag`
     without fetching, so a tag pushed from another checkout was invisible — it
     once compared 0.2.0 against v0.1.1 while v0.1.2 already existed on the

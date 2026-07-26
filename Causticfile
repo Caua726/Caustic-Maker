@@ -25,6 +25,20 @@ target "caustic-mk" {
 profile "release" { flags "-O2" }
 profile "debug"   { flags "-O0" }
 
+# One file for every architecture and every OS. Used with the multi-architecture
+# triple:
+#
+#     caustic-mk build caustic-mk --target=caustic --profile bundle
+#
+# `--target=caustic` names both CausticOS architectures, and `mode "compat"`
+# welds the OS bodies in, so the result carries at once:
+#   • a PE, for Windows;
+#   • two ELF bodies (x86_64 and aarch64) behind a shell dispatcher that picks
+#     one by `uname -m` — which is how it runs on Linux, since a file whose first
+#     bytes are `MZ` is not something binfmt_elf will load;
+#   • a CST_ container with one CausticOS slice per architecture.
+profile "bundle" { flags "-O2" mode "compat" extension "cse" }
+
 # Both suites. The unit half needs no toolchain beyond the compiler; the
 # black-box half spawns the maker against the fixtures in tests/fixtures/.
 script "test" {

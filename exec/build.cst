@@ -503,10 +503,43 @@ fn _rescue_pdb(out_path as *u8, tmp_out as *u8) as void {
     let is *u8 as found with mut = cast(*u8, 0);
     if (sys.file_exists(beside) == 1) { found = beside; }
     else if (sys.file_exists(in_cwd) == 1) { found = in_cwd; }
-    if (cast(i64, found) == 0) { return; }
-    if (c.streq_lit(found, want) == 1) { return; }
-    io.unlink(want);
-    io.rename(found, want);
+    if (cast(i64, found) != 0 && c.streq_lit(found, want) == 0) {
+        io.unlink(want);
+        io.rename(found, want);
+    }
+    _sweep_sub_pdbs(tmp_out);
+}
+
+// A universal bundle (`--target=caustic --mode=compat`) is orchestrated as
+// several single-target links, and each PE sub-build drops its own `.pdb` in the
+// current directory named after ITS temp output — leaving
+// `<out>.tmp.__cse_pe.tmp.pdb` and `<out>.tmp.__cse_pea64.tmp.pdb` behind. Those
+// belong to intermediate files that no longer exist, so nothing will ever read
+// them and `clean` does not know their names.
+//
+// Swept by pattern rather than by listing the compiler's internal temp names,
+// which are its business and free to change: anything starting with our own temp
+// basename and ending in `.pdb` was produced by this build and by nothing else.
+fn _sweep_sub_pdbs(tmp_out as *u8) as void {
+    if (sys.dry_run() == 1) { return; }
+    let is *u8 as pat = c.str_cat(sys.basename(tmp_out), "*.pdb");
+    let is i32 as n = c.glob_expand(pat);
+    if (n <= 0) { return; }
+    // Copy the matches out before unlinking: the glob table is shared, and any
+    // later expansion would overwrite it mid-loop.
+    let is *u8 as buf = c.big_alloc(cast(i64, n) * 8);
+    let is *i64 as arr = cast(*i64, buf);
+    let is i32 as i with mut = 0;
+    while (i < n) {
+        arr[i] = cast(i64, c.str_cat("", c.glob_get(i)));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        io.unlink(cast(*u8, arr[i]));
+        i = i + 1;
+    }
+    c.big_free(buf, cast(i64, n) * 8);
 }
 
 fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
@@ -516,7 +549,7 @@ fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
         // output directory.
         io.unlink(tmp_out);
         io.unlink(c.str_cat(tmp_out, ".pdb"));
-        io.unlink(c.str_cat(sys.basename(tmp_out), ".pdb"));
+        _sweep_sub_pdbs(tmp_out);
         c.eprint("error: build failed");
         c.write_nl(2);
         return rc;
