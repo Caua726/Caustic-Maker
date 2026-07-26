@@ -297,6 +297,37 @@ overrides the triple from `flags` and gives that triple its own output and cache
 directories (`build/windows-x86_64/…`, `.caustic/windows-x86_64/`), so several
 triples coexist without clobbering each other.
 
+### One file for every architecture and OS
+
+The CSE container has a multi-architecture form, and the `caustic` triple names
+every architecture CausticOS runs on. With `mode "compat"` on top, a single build
+produces one artifact that is simultaneously:
+
+- a **PE per architecture** — Windows loads it directly;
+- **two ELF bodies** (x86_64 and aarch64) behind a `uname -m` shell dispatcher;
+- a **`CST_` container** with one CausticOS slice per architecture.
+
+```
+profile "bundle" { flags "-O2" mode "compat" extension "cse" }
+```
+
+```bash
+caustic-mk build caustic-mk --target=caustic --profile bundle
+#  -> build/caustic/caustic-mk.cse
+```
+
+```bash
+sh ./caustic-mk.cse --version     # Linux, either architecture
+./caustic-mk.cse --version        # Windows
+```
+
+On Linux the file has to go through a shell: its first bytes are `MZ`, so
+`binfmt_elf` will not load it, and it is the shell's ENOEXEC fallback that runs
+the embedded dispatcher. The flip side is that a host registering a
+`binfmt_misc` handler for `MZ` — a wine install — takes a bare
+`./caustic-mk.cse` and runs the **Windows** body instead; `sh ./caustic-mk.cse`
+always gets the native one.
+
 ### include
 
 ```
