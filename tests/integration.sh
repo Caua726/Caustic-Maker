@@ -442,18 +442,35 @@ if use_fixture nested-out; then
 fi
 
 # ─── completions ─────────────────────────────────────────
-step "completions carry this manifest's names"
+# The emitted script must be project-INDEPENDENT. It used to have the current
+# manifest's target names written into it as a literal list, which read as an
+# advantage and was the opposite: a completion is installed once and used in
+# every project, so the copy described one checkout and named targets that do
+# not exist in any other. The shipped script asks `caustic-mk list` at
+# completion time instead, falling back to reading the nearest Causticfile.
+step "completions are live, not a snapshot of this manifest"
 if use_fixture deps-tree; then
     mk completions bash
     expect_rc 0 "bash completion is emitted"
     expect_out "complete -F _caustic_mk caustic-mk" "and registers itself"
-    expect_out "everything" "with the manifest's own target names in it"
+    expect_out '"$bin" list' "asking the binary for the names at completion time"
+    expect_out "Causticfile" "with the manifest as the fallback"
+    expect_no_out "everything" "and none of this fixture's target names baked in"
     mk completions zsh
     expect_rc 0 "zsh completion is emitted"
     expect_out "#compdef caustic-mk" "with the compdef marker"
+    expect_no_out "everything" "and no baked-in names either"
     mk completions fish
     expect_rc 1 "an unsupported shell is an error"
 fi
+# Setting a shell up happens outside any project as often as inside one, and the
+# output does not depend on the manifest — so it must not demand one. It used to
+# be dispatched after the manifest search and fail with "Causticfile not found".
+step "completions need no Causticfile"
+mkdir -p "$WORK/nowhere" && cd "$WORK/nowhere" || true
+mk completions bash
+expect_rc 0 "outside a project, bash completion still comes out"
+expect_out "_caustic_mk()" "and it is the real script"
 
 # ─── --version ───────────────────────────────────────────
 step "--version"

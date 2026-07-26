@@ -31,6 +31,18 @@ Found while building and publishing the 0.2.0 artifacts.
     longer exist, so nothing would ever read them and `clean` did not know their
     names. Now swept by pattern, on success and on failure alike.
 
+20. **`completions <shell>` emitted a snapshot of the current manifest.** It
+    wrote this project's target and script names into the script as a literal
+    list, which sounded like the one thing a generic completion cannot know and
+    was the opposite: a completion is installed once and used in every project,
+    so the copy described one checkout and named nothing that exists in any
+    other. It now prints the script kept in the parent repo's
+    `tools/completions/`, which asks `caustic-mk list` at completion time and
+    falls back to reading the nearest `Causticfile` — live everywhere, and aware
+    of subcommands, flag values, `--profile`, `-D NAME=`, `--` forwarding and the
+    `.cse` names the toolchain ships under. It also no longer needs a
+    `Causticfile` to run, which is where you are when setting your shell up.
+
 ### Added
 
 - **`profile "bundle"`** in the maker's own manifest: with the multi-architecture

@@ -300,6 +300,19 @@ fn main(argc as i64, argv as i64) as i32 {
         return scripts.exec_init(o.force);
     }
 
+    // Neither does `completions`: the scripts it prints read the project they
+    // are used in at completion time, so the same output is right everywhere.
+    // It used to sit after the manifest search and refuse to run outside a
+    // project — exactly where you are when setting your shell up.
+    if (c.streq_lit(cmd, "completions") == 1) {
+        let is *u8 as shell with mut = o.positional;
+        if (cast(i64, shell) == 0) {
+            c.eprint("error: usage: caustic-mk completions bash|zsh\n");
+            return 1;
+        }
+        return doctor.exec_completions(shell);
+    }
+
 
     if (_find_manifest() == 0) {
         // `clean` still does its best without a manifest: the fixed directories
@@ -388,15 +401,6 @@ fn main(argc as i64, argv as i64) as i32 {
 
     if (c.streq_lit(cmd, "doctor") == 1) {
         return doctor.exec_doctor(&proj);
-    }
-
-    if (c.streq_lit(cmd, "completions") == 1) {
-        let is *u8 as shell with mut = o.positional;
-        if (cast(i64, shell) == 0) {
-            c.eprint("error: usage: caustic-mk completions bash|zsh\n");
-            return 1;
-        }
-        return doctor.exec_completions(&proj, shell);
     }
 
     // `why` answers "which input does the build think changed", using the very
