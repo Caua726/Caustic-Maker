@@ -527,8 +527,27 @@ fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
         c.write_nl(1);
         return 0;
     }
+    // "built" is a claim about a FILE, so check the file is there before making
+    // it. A compiler that died without writing its output used to land exactly
+    // here: rc came back 0 (a signal death decodes to 0 through a bare
+    // WEXITSTATUS — fixed now in std/process.exit_code_of), rename had nothing
+    // to rename and said nothing about it, and the build reported success for a
+    // target that did not exist. One missing binary in ninety-nine, and not one
+    // line of output admitted it.
+    if (io.exists(tmp_out) == 0) {
+        c.eprint("error: the compile reported success but produced no ");
+        c.eprint(tmp_out);
+        c.write_nl(2);
+        return cast(i32, 1);
+    }
     io.unlink(out_path);
     io.rename(tmp_out, out_path);
+    if (io.exists(out_path) == 0) {
+        c.eprint("error: could not move the output into place: ");
+        c.eprint(out_path);
+        c.write_nl(2);
+        return cast(i32, 1);
+    }
     _rescue_pdb(out_path, tmp_out);
     if (sys.verbosity() >= sys.V_NORMAL) {
         c.print("  built: ");

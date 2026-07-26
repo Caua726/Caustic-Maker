@@ -323,7 +323,9 @@ fn wait_any(out_rc as *i32) as i64 {
         let is i32 as status with mut = 0;
         let is i64 as pid = os.linux.wait4(0 - 1, &status, 0, cast(*u8, 0));
         if (pid < 0) { return 0 - 1; }
-        *out_rc = (status >> 8) & 255;
+        // proc.exit_code_of, not a bare WEXITSTATUS: a child killed by a signal
+        // has zero in the high byte, so the raw shift reports a crash as 0.
+        *out_rc = proc.exit_code_of(status);
         return pid;
     }
     return 0 - 1;
