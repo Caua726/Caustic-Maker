@@ -1584,6 +1584,25 @@ fn exec_watch(proj as *parser.Project, target_name as *u8, continue_flag as i32,
 fn _build_all_parallel(proj as *parser.Project, continue_flag as i32,
                        incremental as i32, workers as i32) as i32 {
     let is i32 as n = proj.target_count;
+
+    // Resolve every git dependency here, before a single child is spawned.
+    //
+    // Children are separate `caustic-mk build <name>` processes, and each one
+    // resolves dependencies for itself. Two that want the same dependency both
+    // find .caustic/deps/<name> missing and both run `git clone` into it: one
+    // wins, the other fails, and the target that asked for it fails with it.
+    // The failure only appears on a clean checkout — anywhere the directory
+    // already exists, every child short-circuits and the race is invisible.
+    //
+    // `--no-deps` already says the parent owns the ordering of `depends`. This
+    // is the same principle applied to the other kind of dependency: resolve
+    // once, serially, up here, and every child then finds it present.
+    if (deps.resolve_project_deps(proj) != 0) { return 1; }
+    let is i32 as di with mut = 0;
+    while (di < n) {
+        if (deps.resolve_deps(parser.get_target(proj, di)) != 0) { return 1; }
+        di = di + 1;
+    }
     // Per-target state: 0 = pending, 1 = running, 2 = done, 3 = failed/skipped.
     let is *i32 as state = cast(*i32, c.big_alloc(cast(i64, n) * 4));
     let is *i64 as pids = cast(*i64, c.big_alloc(cast(i64, n) * 8));

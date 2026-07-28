@@ -529,6 +529,29 @@ elif use_fixture dep-qualified; then
     expect_file "build/unqualified" "and that target is built too"
 fi
 
+# ─── one dependency, four targets, built at once ───────────────────────────
+# Children are separate processes and each used to resolve dependencies for
+# itself, so several wanting the same one raced to clone into the same
+# directory. Only reproducible from a clean cache: anywhere the clone already
+# exists, every child short-circuits and nothing races.
+step "a dependency shared by parallel targets is cloned once"
+if ! command -v git >/dev/null 2>&1; then
+    note "git not available — skipping"
+elif use_fixture dep-parallel; then
+    ( cd widget-src \
+      && git init -q . \
+      && git add -A \
+      && git -c user.email=t@t -c user.name=t commit -qm w ) >/dev/null 2>&1
+
+    mk build all -j 4
+    expect_rc 0 "four targets sharing one dependency build together"
+    expect_no_out "failed to clone dependency" "no child lost the race"
+    expect_file "build/one" "one"
+    expect_file "build/two" "two"
+    expect_file "build/three" "three"
+    expect_file "build/four" "four"
+fi
+
 cd "$HERE" || exit 1
 printf "\n%s\n" "${B}=== integration: pass=$PASS fail=$FAIL ===${N}"
 [ "$FAIL" = 0 ] || exit 1

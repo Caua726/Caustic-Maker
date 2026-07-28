@@ -1,0 +1,6 @@
+use "widget/thing.cst" as widget;
+
+fn main() as i32 {
+    if (widget.thing_value() != 42) { return 1; }
+    return 0;
+}

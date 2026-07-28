@@ -1,0 +1,11 @@
+name "dep-parallel"
+
+# Both targets want the same dependency, and `build all -j 4` builds them in
+# separate processes at the same time. Before the parent resolved dependencies
+# up front, both raced to clone into .caustic/deps/widget and one of them lost.
+depend "widget" in "./widget-src"
+
+target "one" { src "one.cst" out "build/one" }
+target "two" { src "two.cst" out "build/two" }
+target "three" { src "three.cst" out "build/three" }
+target "four" { src "four.cst" out "build/four" }
