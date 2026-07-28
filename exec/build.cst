@@ -73,6 +73,22 @@ fn _prepare_output_path(t as *parser.Target, proj as *parser.Project) as *u8 {
     return out_path;
 }
 
+// " --path <deps dir>", once, when anything is depended on at all.
+//
+// The per-dependency path below puts each clone's *contents* on the search
+// path, so a dependency's own module reads `use "core/bytes.cst"`. That is the
+// wrong name for a consumer to write: two dependencies that both have a
+// `core/` — and a library of any size has one — resolve to whichever was
+// declared first, silently. Naming the parent as well makes the qualified form
+// `use "caustic-compact/core/bytes.cst"` resolve, where the clone directory is
+// the namespace and there is nothing to collide.
+//
+// Both forms stay valid; this only adds a name that used not to resolve.
+fn _deps_root_path(a as *u8, b as *u8) as *u8 {
+    if (cast(i64, a) == 0 && cast(i64, b) == 0) { return c.str_dup("", 0); }
+    return c.str_cat(" --path ", sys.DEPS_DIR);
+}
+
 // " --path <dir>" for each git dependency in a list.
 fn _dep_paths(head as *u8) as *u8 {
     let is *u8 as out with mut = c.str_dup("", 0);
@@ -112,7 +128,9 @@ fn _compile_tail(t as *parser.Target, proj as *parser.Project) as *u8 {
         let is *u8 as ver_v = c.str_dup(proj.version_ptr, proj.version_len);
         cmd = c.str_cat3(cmd, " --app-version=", ver_v);
     }
-    // Dependencies: the project's shared ones, then the target's own.
+    // Dependencies: the deps root (for the qualified form), then the project's
+    // shared ones, then the target's own.
+    cmd = c.str_cat(cmd, _deps_root_path(proj.deps, t.deps));
     cmd = c.str_cat(cmd, _dep_paths(proj.deps));
     cmd = c.str_cat(cmd, _dep_paths(t.deps));
     return cmd;

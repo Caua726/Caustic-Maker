@@ -16,6 +16,16 @@
 
 set -u
 
+# A git hook runs its hook with GIT_DIR, GIT_INDEX_FILE and friends exported,
+# and they are inherited by everything downstream — the suite, the maker, and
+# the `git clone` the maker runs to resolve a dependency. A case that creates a
+# repository would then commit into the repository being committed to, and the
+# clone would look for its source in the wrong place. The gate runs this suite
+# from exactly that context, so scrub the inherited git environment: every git
+# command below has to mean the directory it is standing in.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX GIT_COMMON_DIR 2>/dev/null || true
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 FIXTURES="$HERE/fixtures"
@@ -486,6 +496,37 @@ if use_fixture dry-run; then
     mk --help
     expect_rc 0 "--help exits 0"
     expect_out "usage: caustic-mk" "and prints the usage"
+fi
+
+# ─── a git dependency is importable under its declared name ────────────────
+# The per-dependency --path puts the clone's *contents* on the search path, so
+# only `use "thing.cst"` resolved. Two dependencies with a `core/` — and a
+# library of any size has one — then resolve to whichever was declared first,
+# silently. The deps root is on the path as well so the qualified form names
+# the dependency, and the unqualified one has to keep working.
+step "a git dependency resolves under its declared name"
+if ! command -v git >/dev/null 2>&1; then
+    note "git not available — skipping"
+elif use_fixture dep-qualified; then
+    # The `in` clause is a clone source, so the fixture's plain directory has to
+    # become a repo first. Identity is passed per-command: a test must not
+    # depend on the machine having a global git identity.
+    if ( cd widget-src \
+         && git init -q . \
+         && git add -A \
+         && git -c user.email=t@t -c user.name=t commit -qm w ) >/dev/null 2>&1
+    then ok "the dependency's source is a repository"
+    else bad "the dependency's source is a repository"; note "git init/commit failed"
+    fi
+
+    mk build qualified
+    expect_rc 0 'use "widget/thing.cst" resolves — the dependency is its own namespace'
+    expect_file "build/qualified" "and the target is built"
+    expect_file ".caustic/deps/widget/thing.cst" "the clone landed under the declared name"
+
+    mk build unqualified
+    expect_rc 0 'use "thing.cst" still resolves — the older form is unbroken'
+    expect_file "build/unqualified" "and that target is built too"
 fi
 
 cd "$HERE" || exit 1

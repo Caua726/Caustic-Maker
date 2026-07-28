@@ -1,0 +1,21 @@
+name "dep-qualified"
+
+# `widget-src` is turned into a git repo by the test step, and cloned from
+# there into .caustic/deps/widget — so the dependency's directory name is the
+# name it was declared under, not the name of the directory it came from.
+
+# The qualified form: `use "widget/thing.cst"`, namespaced by the dependency.
+target "qualified" {
+    src "main_qualified.cst"
+    out "build/qualified"
+    depend "widget" in "./widget-src"
+}
+
+# The unqualified form: `use "thing.cst"`, straight into the clone's contents.
+# It resolved before the deps root was on the search path and has to keep
+# resolving after.
+target "unqualified" {
+    src "main_unqualified.cst"
+    out "build/unqualified"
+    depend "widget" in "./widget-src"
+}

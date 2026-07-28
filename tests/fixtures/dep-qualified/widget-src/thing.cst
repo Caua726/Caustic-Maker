@@ -1,0 +1,8 @@
+// The dependency's one module. Its directory is named `widget-src`; the
+// dependency is declared as `widget`, so the qualified import has to be
+// `use "widget/thing.cst"` — the declared name, which is what the clone
+// directory under .caustic/deps is called.
+
+fn thing_value() as i64 {
+    return 42;
+}
