@@ -947,12 +947,29 @@ fn _obj_key(modpath as *u8, tail as *u8, tool_id as i64) as i64 {
     return h;
 }
 
-// Identity of the compiler binary: mtime folded with size. Cheap, and enough to
-// notice "the compiler was rebuilt" without hashing a 1.7 MB file per build.
+// Identity of the compiler binary, by CONTENT.
+//
+// This was mtime folded with size, on the reasoning that hashing a 1.7 MB file
+// per build was not worth it to notice a rebuild. It is — because the compiler
+// rebuilds ITSELF. `caustic-mk build caustic --incremental` rewrites the very
+// binary this identifies, so the mtime moved on every run even though the
+// self-host fixpoint makes the new bytes identical to the old. Every object key
+// changed, every module was a miss, and the previous run's objects were then
+// swept as stale: 120 rebuilt, 0 reused, forever, and the cache never paid for
+// itself on the one target that needs it most.
+//
+// Hashing costs one pass over the binary against compiling every module.
 fn _tool_id(caustic_bin as *u8) as i64 {
-    let is i64 as m = io.mtime(caustic_bin);
-    let is i64 as s = c.read_file_size(caustic_bin);
-    return c.hash_mix(m, s);
+    let is i64 as h = c.hash_file(caustic_bin);
+    if (h == 0) {
+        // Unreadable: fall back to the old identity rather than collapsing
+        // every compiler to the same key, which would reuse objects across a
+        // real toolchain change.
+        let is i64 as m = io.mtime(caustic_bin);
+        let is i64 as s = c.read_file_size(caustic_bin);
+        return c.hash_mix(m, s);
+    }
+    return c.hash_mix(h, c.read_file_size(caustic_bin));
 }
 
 // ── Object cache GC ──────────────────────────────────────────
