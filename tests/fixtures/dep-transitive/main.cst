@@ -1,0 +1,6 @@
+use "mid/mid.cst" as mid;
+
+fn main() as i32 {
+    if (mid.mid_value() != 42) { return 1; }
+    return 0;
+}

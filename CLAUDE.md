@@ -48,7 +48,7 @@ tools/prerelease.sh              # version bookkeeping before a tag
 | `exec/build.cst` | three build paths, up-to-date check, object cache, `-j`, `why`, `graph` |
 | `exec/scripts.cst` | `run` / `test` / `list` / `install` / `clean` / `init` |
 | `exec/doctor.cst` | `doctor` and `completions` |
-| `exec/deps.cst` | git dependency resolution |
+| `exec/deps.cst` | git dependency resolution: the transitive walk, the dedup/cycle stop, version conflicts |
 | `core/common.cst` | strings, paths, globs, hashes, the shared heap |
 | `core/sysutil.cst` | subprocess, filesystem, toolchain discovery, output control |
 | `version.cst` | the version `--version` reports; tracked, kept in step by `version_file` |
@@ -92,6 +92,18 @@ These are the ones that cost an hour to rediscover:
   dead-branch elimination never fires — the wrong platform's syscalls survive
   into the binary and codegen rejects them. This is why the maker once could not
   be built for Windows at all.
+- **Read a manifest with the lexer, never with a byte match.** `depend` and
+  `depends` share their first six bytes and mean unrelated things — `depends
+  "x"` orders one target against another, `depend "x" in "u"` names an external
+  repository. A six-byte match reads every build-order line in a valid manifest
+  as a dependency with no url. `deps.scan_manifest_buf` goes through
+  `cfile_lexer` (save/restore around it, the way `include` does), which also
+  gets comments and quoting for free.
+- **`.caustic/deps/<name>` is one directory, so a name is one version.** That is
+  why the transitive walk carries a registry of what it has already resolved:
+  it is the dedup, the cycle stop, and the thing that turns two dependencies
+  pinning different tags into an error instead of a race between two clones. The
+  root manifest outranks the graph — a consumer has no other lever.
 - **Verbosity must not reach a cache key.** `_compile_tail` is the semantic part
   (hashed into the object key); `_compile_cmd_tail` adds `-q`. Mixing them made
   a quiet build invalidate every cached object.

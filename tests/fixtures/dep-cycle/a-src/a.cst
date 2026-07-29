@@ -1,0 +1,5 @@
+use "b/b.cst" as b;
+
+fn a_value() as i64 {
+    return b.b_value();
+}

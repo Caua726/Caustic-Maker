@@ -503,6 +503,31 @@ depend "somelib" in "https://github.com/user/somelib" tag "v1.0.0"
 sources. Everything resolves through the Caustic toolchain — there is no
 external package manager in the loop.
 
+The graph is **transitive**: a dependency's own `Causticfile` is read after it
+is cloned, and its `depend` lines are resolved the same way, to any depth. You
+declare what you use; you do not re-declare what it uses. Its `system` libraries
+come along too, so a dependency that needs `-lm` gets it.
+
+Every clone lands in `.caustic/deps/<declared name>/`, whatever its depth in the
+graph, and the qualified import `use "<name>/<module>.cst"` reaches it from
+anywhere — including from inside another dependency.
+
+That one directory per name is also the constraint: **a name can only be at one
+version.** Two dependencies pinning different tags of a third is an error naming
+both, not a race between two clones:
+
+```
+error: dependency 'leaf' is required at two versions
+  tag "v1" by a
+  tag "v2" by b
+  declare it in this Causticfile to settle which one is used
+```
+
+A `depend` in *your* manifest outranks anything the graph asks for, which is how
+you settle that — and the only lever you have over two repositories you do not
+own. A dependency declared without a `tag` takes whatever is already cloned, so
+it never conflicts. A cycle (`a` → `b` → `a`) resolves each name once and stops.
+
 ### What `clean` removes
 
 Everything a build writes, not just the two well-known directories: each
@@ -520,7 +545,7 @@ cache directory, and `out_dir`. `--dry-run` lists what would go.
 | `exec/build.cst` | 1650 | the three build paths, up-to-date check, object cache, `-j`, `why`, `graph` |
 | `exec/scripts.cst` | 419 | `run` / `test` / `list` / `install` / `clean` / `init` |
 | `exec/doctor.cst` | 331 | `doctor` and `completions` |
-| `exec/deps.cst` | 150 | git dependency resolution |
+| `exec/deps.cst` | 394 | git dependency resolution, transitive |
 | `core/common.cst` | 673 | strings, paths, globs, hashes, the shared heap |
 | `core/sysutil.cst` | 902 | subprocess, filesystem, toolchain discovery, output control |
 | `version.cst` | 2 | the version `--version` reports, kept in step by `version_file` |

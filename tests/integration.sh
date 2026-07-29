@@ -89,6 +89,13 @@ expect_no_out() {
     esac
 }
 expect_file()    { if [ -e "$1" ]; then ok "$2"; else bad "$2"; note "missing file: $1"; fi; }
+# For asserting WHICH version of a clone is on disk: existence alone cannot
+# tell two tags of one repository apart.
+expect_file_is() { # expect_file_is <path> <content> <desc>
+    if [ ! -e "$1" ]; then bad "$3"; note "missing file: $1"; return; fi
+    if [ "$(cat "$1")" = "$2" ]; then ok "$3"
+    else bad "$3"; note "want '$2', got '$(cat "$1")'"; fi
+}
 expect_no_file() { if [ -e "$1" ]; then bad "$2"; note "should not exist: $1"; else ok "$2"; fi; }
 expect_exec()    { if [ -x "$1" ]; then ok "$2"; else bad "$2"; note "not executable: $1"; fi; }
 
@@ -550,6 +557,104 @@ elif use_fixture dep-parallel; then
     expect_file "build/two" "two"
     expect_file "build/three" "three"
     expect_file "build/four" "four"
+fi
+
+# ─── a dependency's own dependencies are resolved too ──────────────────────
+# The walk stopped at exactly one level: `mid` was cloned, the `depend` line in
+# ITS Causticfile was never read, and `leaf` never arrived. A library could not
+# add a dependency without every consumer re-declaring it.
+step "the dependency graph is walked transitively"
+if ! command -v git >/dev/null 2>&1; then
+    note "git not available — skipping"
+elif use_fixture dep-transitive; then
+    for r in mid-src leaf-src; do
+        ( cd "$r" \
+          && git init -q . \
+          && git add -A \
+          && git -c user.email=t@t -c user.name=t commit -qm "$r" ) >/dev/null 2>&1
+    done
+
+    mk build app
+    expect_rc 0 "the transitive dependency resolves"
+    expect_file ".caustic/deps/mid/mid.cst" "the declared dependency is cloned"
+    expect_file ".caustic/deps/leaf/leaf.cst" "and so is the one it declares itself"
+    expect_file "build/app" "the target builds against both"
+    # `depends "mid"` in mid's manifest is target ordering, not a dependency.
+    # Six bytes of `depend` match it, and the resolution then fails on a
+    # dependency named "mid" that has no url.
+    expect_no_out "has no url" "a 'depends' line is not read as a dependency"
+fi
+
+# ─── one name, two versions ────────────────────────────────────────────────
+# .caustic/deps/<name> is a single directory, so two dependencies pinning
+# different tags of a third cannot both be satisfied. It used to be decided by
+# whichever clone ran last, leaving the loser compiled against a version it
+# never asked for.
+step "two dependencies pinning one name at different tags is an error"
+if ! command -v git >/dev/null 2>&1; then
+    note "git not available — skipping"
+elif use_fixture dep-conflict; then
+    for r in a-src b-src; do
+        ( cd "$r" \
+          && git init -q . \
+          && git add -A \
+          && git -c user.email=t@t -c user.name=t commit -qm "$r" ) >/dev/null 2>&1
+    done
+    # Two tags of one repository, told apart by a file rather than by the tag
+    # name — the assertion has to see which one is on disk.
+    ( cd leaf-src \
+      && git init -q . \
+      && echo v1 > VERSION \
+      && git add -A \
+      && git -c user.email=t@t -c user.name=t commit -qm v1 \
+      && git tag v1 \
+      && echo v2 > VERSION \
+      && git add -A \
+      && git -c user.email=t@t -c user.name=t commit -qm v2 \
+      && git tag v2 ) >/dev/null 2>&1
+
+    mk build app
+    expect_rc 1 "the disagreement fails the build"
+    expect_out "is required at two versions" "and says what disagrees"
+    expect_out "by a" "naming one dependency that asked"
+    expect_out "by b" "and the other"
+
+    # The consumer's lever: a top-level `depend` outranks anything the graph
+    # asks for, which is the only way to settle a disagreement between two
+    # repositories you do not own.
+    printf '\ndepend "leaf" in "./leaf-src" tag "v1"\n' >> Causticfile
+    mk build app
+    expect_rc 0 "a top-level pin settles it"
+    expect_file_is ".caustic/deps/leaf/VERSION" "v1" "and it is the pinned version on disk"
+
+    # Two pins in the manifest you are holding is a contradiction with no
+    # winner to pick — outranking the graph does not outrank itself.
+    printf '\ndepend "leaf" in "./leaf-src" tag "v2"\n' >> Causticfile
+    mk build app
+    expect_rc 1 "two top-level pins of one name is an error too"
+    expect_out "both are declared here" "and the way out is the manifest at hand"
+fi
+
+# ─── a cycle in the manifests terminates ───────────────────────────────────
+# `a` depends on `b`, `b` back on `a`. A transitive walk with no memory follows
+# that until the depth cap, or forever without one.
+step "a dependency cycle is not followed twice"
+if ! command -v git >/dev/null 2>&1; then
+    note "git not available — skipping"
+elif use_fixture dep-cycle; then
+    for r in a-src b-src; do
+        ( cd "$r" \
+          && git init -q . \
+          && git add -A \
+          && git -c user.email=t@t -c user.name=t commit -qm "$r" ) >/dev/null 2>&1
+    done
+
+    mk build app
+    expect_rc 0 "the cycle resolves instead of running away"
+    expect_no_out "nest more than" "the depth cap was never the thing that stopped it"
+    expect_file ".caustic/deps/a/a.cst" "both sides are cloned"
+    expect_file ".caustic/deps/b/b.cst" "once each"
+    expect_file "build/app" "and the target builds"
 fi
 
 cd "$HERE" || exit 1

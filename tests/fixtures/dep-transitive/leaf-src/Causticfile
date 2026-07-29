@@ -1,0 +1,6 @@
+name "leaf"
+
+target "leaf" {
+    src "leaf.cst"
+    out "build/leaf"
+}

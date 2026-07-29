@@ -1,0 +1,3 @@
+name "a"
+
+depend "b" in "./b-src"

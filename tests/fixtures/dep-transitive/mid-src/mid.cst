@@ -1,0 +1,7 @@
+// Imports its own dependency by the qualified form — the name `leaf` is the
+// name it was declared under, which is the directory the clone landed in.
+use "leaf/leaf.cst" as leaf;
+
+fn mid_value() as i64 {
+    return leaf.leaf_value();
+}

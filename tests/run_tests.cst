@@ -18,6 +18,10 @@ use "../../std/io.cst" as io;
 use "../core/common.cst" as c;
 use "../core/sysutil.cst" as sys;
 use "../parser/parser.cst" as parser;
+// The one thing pulled in from exec/: the manifest scan that decides how the
+// dependency graph is walked takes a buffer, so it is testable here without a
+// clone, a directory or a process.
+use "../exec/deps.cst" as deps;
 
 let is i32 as _pass with mut = 0;
 let is i32 as _fail with mut = 0;
@@ -373,6 +377,59 @@ fn t_interpolate() as void {
     _check_str("mixed",                  _interp("$DIR/$HOME"), "build/$HOME");
 }
 
+// === scan_manifest_buf ===
+// What the resolver reads out of a CLONE's Causticfile in order to keep
+// walking: its `system` libs, and its own `depend` clauses.
+//
+// The trap is `depends`, which orders one target against another and shares
+// its first six bytes with `depend`. Matching six bytes reads every
+// build-order line in a manifest as an external dependency with no url, so a
+// perfectly good project fails to resolve. The scan goes through the real
+// lexer, which is also why a commented-out clause is not one.
+
+fn _scan(m as *u8) as *parser.Dep {
+    return cast(*parser.Dep, deps.scan_manifest_buf(m, c.strlen(m), "Causticfile"));
+}
+
+fn t_scan_manifest() as void {
+    _p("\n--- scan_manifest_buf ---\n");
+
+    let is i32 as libs_before = parser.system_lib_count;
+    let is *parser.Dep as first = _scan("name \"lib\"\nsystem \"m\"\ndepend \"alpha\" in \"u1\"\ntarget \"t\" {\n    depends \"other\"\n}\n# depend \"commented\" in \"nope\"\ndepend \"beta\" in \"u2\" tag \"v9\"\n");
+
+    _check("a depend is found", cast(i32, cast(i64, first) != 0));
+    if (cast(i64, first) == 0) { return; }
+    _check_str("first name",             c.str_dup(first.name_ptr, first.name_len), "alpha");
+    _check_str("first url",              c.str_dup(first.url_ptr, first.url_len), "u1");
+    _check_int("first carries no tag",   cast(i64, first.tag_len), 0);
+    _check("the system lib is collected", cast(i32, parser.system_lib_count > libs_before));
+
+    let is *parser.Dep as second = cast(*parser.Dep, first.next);
+    _check("the second depend is found", cast(i32, cast(i64, second) != 0));
+    if (cast(i64, second) == 0) { return; }
+    _check_str("second name",            c.str_dup(second.name_ptr, second.name_len), "beta");
+    _check_str("second url",             c.str_dup(second.url_ptr, second.url_len), "u2");
+    _check_str("second tag",             c.str_dup(second.tag_ptr, second.tag_len), "v9");
+    // Exactly two. `depends "other"` is not one of them, and neither is the
+    // commented-out clause.
+    _check_int("and nothing else",       cast(i64, second.next), 0);
+
+    _check_int("a manifest of depends alone yields none",
+               cast(i64, _scan("target \"a\" {\n    depends \"b\"\n    depends \"c\"\n}\n")), 0);
+    _check_int("a manifest with no dependency yields none",
+               cast(i64, _scan("name \"x\"\n")), 0);
+    // A dependency of a dependency reached by url alone: the `tag` clause is
+    // optional and its absence must not swallow the next line.
+    let is *parser.Dep as untagged = _scan("depend \"a\" in \"u\"\ndepend \"b\" in \"v\"\n");
+    _check("two untagged clauses parse", cast(i32, cast(i64, untagged) != 0));
+    if (cast(i64, untagged) == 0) { return; }
+    _check_str("first of them",          c.str_dup(untagged.name_ptr, untagged.name_len), "a");
+    let is *parser.Dep as after = cast(*parser.Dep, untagged.next);
+    _check("the second survived",        cast(i32, cast(i64, after) != 0));
+    if (cast(i64, after) == 0) { return; }
+    _check_str("second of them",         c.str_dup(after.name_ptr, after.name_len), "b");
+}
+
 fn main() as i32 {
     _p("=== caustic-mk unit suite (tests/run_tests.cst) ===\n");
     io.mkdir("tests/tmp");
@@ -386,6 +443,7 @@ fn main() as i32 {
     t_write_if_changed();
     t_glob_expand();
     t_interpolate();
+    t_scan_manifest();
 
     _p("\n=== ");
     if (_fail == 0) { _p("ALL PASSED"); } else { _p("FAILED"); }

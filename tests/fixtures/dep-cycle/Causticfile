@@ -1,0 +1,13 @@
+name "dep-cycle"
+
+# `a` depends on `b`, `b` depends back on `a`. Nobody writes this on purpose;
+# it appears when two libraries in one project grow a use for each other. A
+# transitive walk with no memory follows it until the depth cap stops it, or
+# forever if there is no cap — so the walk remembers every name it has already
+# resolved, and the second sight of `a` ends that branch.
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    depend "a" in "./a-src"
+}

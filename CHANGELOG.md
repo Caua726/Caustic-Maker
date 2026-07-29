@@ -54,6 +54,25 @@ Found while building and publishing the 0.2.0 artifacts.
   dispatcher), under wine, and — extracting its aarch64 slice — under
   `qemu-aarch64`.
 
+- **Transitive dependency resolution.** The walk stopped at exactly one level: a
+  clone's `Causticfile` was opened only to collect its `system` libraries, and
+  its own `depend` lines were never read. A dependency's dependencies simply did
+  not arrive, so a consumer had to re-declare every one of them — and no library
+  could add one without breaking everyone who used it. A clone's manifest is now
+  scanned for `depend` as well, and those resolve the same way, to any depth.
+  Three things the flat `.caustic/deps/<name>/` layout then forces, all handled:
+  a name resolved once is not resolved again (which is also what ends a cycle,
+  `a` → `b` → `a`); **two dependencies pinning one name at different tags is an
+  error naming both**, where before it was decided by whichever `git clone` ran
+  last and the loser was compiled against a version it never asked for; and a
+  `depend` in your own manifest outranks anything the graph asks for, which is
+  the lever that settles it. The scan goes through the real lexer rather than a
+  byte matcher — `depend` and `depends` share six bytes and mean unrelated
+  things, and reading a target-ordering line as an external dependency fails a
+  manifest that is perfectly correct. Nothing was needed on the compile side:
+  the `--path .caustic/deps` the build already emits makes the qualified
+  `use "<dep>/<module>.cst"` resolve at any depth.
+
 18. **`tools/prerelease.sh` compared against stale tags.** It read `git tag`
     without fetching, so a tag pushed from another checkout was invisible — it
     once compared 0.2.0 against v0.1.1 while v0.1.2 already existed on the

@@ -1,0 +1,3 @@
+fn b_value() as i64 {
+    return 7;
+}

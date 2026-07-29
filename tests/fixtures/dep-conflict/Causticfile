@@ -1,0 +1,14 @@
+name "dep-conflict"
+
+# `a` wants leaf v1, `b` wants leaf v2, and .caustic/deps/leaf is one
+# directory. Resolving one level deep this could not happen; transitively it is
+# the ordinary failure, and it used to be settled by whichever `git clone` ran
+# last — the other dependency then compiled against a version it never asked
+# for, silently.
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    depend "a" in "./a-src"
+    depend "b" in "./b-src"
+}

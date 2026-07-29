@@ -1,0 +1,6 @@
+name "b"
+
+# Back to `a`. The manifests are a cycle; the modules are not — b.cst imports
+# nothing, because a cycle between two source files is a different problem
+# belonging to the compiler.
+depend "a" in "./a-src"

@@ -1,0 +1,19 @@
+name "mid"
+
+# The dependency's own dependency. Read out of this file by the resolver after
+# `mid` is cloned, and resolved exactly like one declared at the top level.
+
+depend "leaf" in "./leaf-src"
+
+target "mid" {
+    src "mid.cst"
+    out "build/mid"
+}
+
+# `depends` — build order between two targets of this project, and NOT a
+# dependency. It shares its first six bytes with `depend`, so a scan that
+# matches six bytes and stops reads this line as an external dependency named
+# "mid" with no url, and the resolution of a perfectly good manifest fails.
+target "everything" {
+    depends "mid"
+}

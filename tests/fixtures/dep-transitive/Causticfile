@@ -1,0 +1,16 @@
+name "dep-transitive"
+
+# `mid` is the only dependency this project declares. `mid` declares `leaf`,
+# and nothing here knows that. Resolution used to stop at the first level, so
+# `leaf` was never cloned and mid's own import of it did not resolve — a
+# library could not add a dependency without every consumer re-declaring it.
+#
+# Both clones land flat in .caustic/deps/, so the `--path .caustic/deps` the
+# build already emits is what makes `use "leaf/leaf.cst"` resolve from inside
+# the `mid` clone.
+
+target "app" {
+    src "main.cst"
+    out "build/app"
+    depend "mid" in "./mid-src"
+}

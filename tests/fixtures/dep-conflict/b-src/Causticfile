@@ -1,0 +1,3 @@
+name "b"
+
+depend "leaf" in "./leaf-src" tag "v2"
