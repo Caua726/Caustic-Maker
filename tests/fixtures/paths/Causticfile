@@ -14,3 +14,12 @@ target "staged" {
     out "build/staged"
     source "extra.cst"
 }
+
+# Staged with a linker map: `--map` names the map after the output it was given,
+# which is the maker's temp name, so the map has to follow the rename.
+target "mapped" {
+    src "main.cst"
+    out "build/mapped"
+    source "extra.cst"
+    ldflags "--map"
+}

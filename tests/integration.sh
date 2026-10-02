@@ -270,6 +270,20 @@ if use_fixture obj-cache; then
     expect_rc 0 "a forced rebuild is still correct"
 fi
 
+# ─── a linker map follows the output into place ──────────────────────────────
+# The link writes to `<out>.tmp` and renames it. `--map` names the map after the
+# file it was told to write, so before the fix the map stayed `<out>.tmp.map` and
+# `<out>.map` never existed.
+step "a linker map lands beside the output, not the temp file"
+if use_fixture paths; then
+    mk build mapped
+    expect_rc 0 "staged build with --map succeeds"
+    if [ -s build/mapped.map ]; then ok "build/mapped.map exists"
+    else bad "no build/mapped.map"; ls build | sed 's/^/      /'; fi
+    if [ -e build/mapped.tmp.map ]; then bad "build/mapped.tmp.map was left behind"
+    else ok "no .tmp.map left behind"; fi
+fi
+
 # ─── superseded objects are swept, not accumulated ─────────────────────────
 # Every edit produces a new cache key, so the object built from the previous
 # content is dead the moment it is replaced. Nothing removed them: .caustic/obj/

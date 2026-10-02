@@ -515,9 +515,19 @@ fn _invalidate_deps(src as *u8) as void {
 // building `-o build/win/app.tmp` leaves `./app.tmp.pdb`. Both are checked so
 // this keeps working if that changes.
 fn _rescue_pdb(out_path as *u8, tmp_out as *u8) as void {
-    let is *u8 as want = c.str_cat(out_path, ".pdb");
-    let is *u8 as beside = c.str_cat(tmp_out, ".pdb");
-    let is *u8 as in_cwd = c.str_cat(sys.basename(tmp_out), ".pdb");
+    _rescue_sidecar(out_path, tmp_out, ".pdb");
+    _sweep_sub_pdbs(tmp_out);
+}
+
+// The same for any file the linker names after its output. `--map` in a
+// target's ldflags writes `<output>.map` — `<out>.tmp.map`, beside the temp
+// output — and the rename left it there: a kernel built with a map got
+// `kernel.elf.tmp.map` and no `kernel.elf.map`, so a step that symbolizes the
+// kernel from its map read a stale one, or none.
+fn _rescue_sidecar(out_path as *u8, tmp_out as *u8, ext as *u8) as void {
+    let is *u8 as want = c.str_cat(out_path, ext);
+    let is *u8 as beside = c.str_cat(tmp_out, ext);
+    let is *u8 as in_cwd = c.str_cat(sys.basename(tmp_out), ext);
     let is *u8 as found with mut = cast(*u8, 0);
     if (sys.file_exists(beside) == 1) { found = beside; }
     else if (sys.file_exists(in_cwd) == 1) { found = in_cwd; }
@@ -525,7 +535,6 @@ fn _rescue_pdb(out_path as *u8, tmp_out as *u8) as void {
         io.unlink(want);
         io.rename(found, want);
     }
-    _sweep_sub_pdbs(tmp_out);
 }
 
 // A universal bundle (`--target=caustic --mode=compat`) is orchestrated as
@@ -567,6 +576,7 @@ fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
         // output directory.
         io.unlink(tmp_out);
         io.unlink(c.str_cat(tmp_out, ".pdb"));
+        io.unlink(c.str_cat(tmp_out, ".map"));
         _sweep_sub_pdbs(tmp_out);
         c.eprint("error: build failed");
         c.write_nl(2);
@@ -600,6 +610,7 @@ fn _finish_output(rc as i32, out_path as *u8, tmp_out as *u8) as i32 {
         return cast(i32, 1);
     }
     _rescue_pdb(out_path, tmp_out);
+    _rescue_sidecar(out_path, tmp_out, ".map");
     if (sys.verbosity() >= sys.V_NORMAL) {
         c.print("  built: ");
         c.print(out_path);
