@@ -437,7 +437,9 @@ that declares its own `target "all"` keeps it — `build all` only means
 Commands inherit the environment `caustic-mk` was started with (PATH, HOME,
 `$CAUSTIC_DIR`, …). `env` / `env_default` declare more, at project, target or
 script scope — the narrower scope wins, and `env_default` only applies when the
-variable isn't already set:
+variable isn't already set. A target's `src`, `out` and link inputs may name
+them too (`src "${CAUSTIC_DIR}/src/main.cst"`): the maker expands those itself,
+with the same precedence, since it stats the files before any shell runs.
 
 ```
 env_default "CAUSTIC_DIR" "../Caustic"

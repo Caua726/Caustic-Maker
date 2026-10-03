@@ -1,6 +1,7 @@
 use "../../std/io.cst" as io;
 use "../core/common.cst" as c;
 use "cfile_lexer.cst" as lx;
+use "../../std/env.cst" as envm;
 // Only for os.current(), which folds to a literal — `when os == "..."` needs it.
 use "../../std/os.cst" as os;
 
@@ -22,6 +23,9 @@ struct Input {
     path_ptr as *u8;
     path_len as i32;
     next as *u8;
+    // 1 = a glob naming an environment variable, expanded and matched once the
+    // whole file is parsed (see _expand_target_paths); 0 = final as it stands.
+    pending as i64;
 }
 
 // A bare (ptr,len) name in a list — used for `depends`, which is repeatable.
@@ -599,6 +603,7 @@ fn _new_input_path(kind as i32, path as *u8) as *Input {
     n.path_ptr = path;
     n.path_len = cast(i32, c.strlen(path));
     n.next = cast(*u8, 0);
+    n.pending = 0;
     return n;
 }
 
@@ -627,6 +632,8 @@ fn _path_of(tok as *lx.Token) as *u8 {
     let is *u8 as raw = c.str_dup(tok.ptr, tok.len);
     if (c.strlen(_prefix()) == 0) { return raw; }
     if (raw[0] == 47) { return raw; }               // absolute: leave alone
+    // Rooted at a variable: the variable says where it is, not the include.
+    if (raw[0] == 36) { return raw; }
     return c.path_join(_prefix(), raw);
 }
 
@@ -709,6 +716,15 @@ fn _init_target_defaults(t as *Target, name_tok as *lx.Token) as void {
 // the link order stays the same on every machine.
 fn _add_inputs(t as *Target, kind as i32, tok as *lx.Token) as void {
     let is *u8 as pat = _path_of(tok);
+    // A glob through a variable can only be matched once the variable is known,
+    // which is after the whole file is parsed.
+    if (c.has_glob(pat) == 1 && c.contains(pat, "$") == 1) {
+        let is *Input as n = _new_input_path(kind, pat);
+        n.pending = 1;
+        t.inputs = _link_input(t.inputs, n);
+        t.input_count = t.input_count + 1;
+        return;
+    }
     if (c.has_glob(pat) == 0) {
         t.inputs = _link_input(t.inputs, _new_input_path(kind, pat));
         t.input_count = t.input_count + 1;
@@ -1330,7 +1346,165 @@ fn parse_file(src as *u8, src_len as i64, fname as *u8) as Project {
     proj.profiles = cast(*u8, 0);
 
     _parse_body(&proj);
+    _expand_target_paths(&proj);
     return proj;
+}
+
+// === Environment variables in paths ===
+//
+// A path may name an environment variable — `src "${CAUSTIC_DIR}/src/main.cst"`
+// is how a project builds something from a checkout that lives elsewhere. The
+// build's shell would expand it in the compile command, but the maker reads the
+// path ITSELF first: to check the source exists, to stat it and its imports for
+// the up-to-date decision, to match a glob. Left literal, the existence check
+// failed on a file that was there ("src not found: ${CAUSTIC_DIR}/...") and the
+// target could not be built at all.
+//
+// So a target's paths are expanded once the whole file is parsed — once, so
+// where an `env` sits in the file does not matter — exactly as the shell
+// prologue (sysutil._env_prologue) would leave the variable: the inherited
+// environment, then the project's declarations in order, then the target's;
+// `env` assigns, `env_default` assigns only when the value so far is empty. A
+// name nothing defines stays as written, so the error that follows names the
+// variable rather than a path with a hole in it.
+
+fn _env_apply(head as *u8, name as *u8, cur as *u8) as *u8 {
+    let is *u8 as v with mut = cur;
+    let is *EnvVar as e with mut = cast(*EnvVar, head);
+    while (cast(i64, e) != 0) {
+        if (c.streq(e.key_ptr, e.key_len, name) == 1) {
+            let is i32 as empty with mut = 0;
+            if (cast(i64, v) == 0) { empty = 1; }
+            else if (c.strlen(v) == 0) { empty = 1; }
+            if (e.is_default == 0 || empty == 1) {
+                v = c.str_dup(e.val_ptr, e.val_len);
+            }
+        }
+        e = cast(*EnvVar, e.next);
+    }
+    return v;
+}
+
+// The value `name` has when a command of this target runs, or null if unset.
+fn env_value(name as *u8, proj_env as *u8, t_env as *u8) as *u8 {
+    let is *u8 as v with mut = envm.getenv(name);
+    v = _env_apply(proj_env, name, v);
+    v = _env_apply(t_env, name, v);
+    return v;
+}
+
+fn _is_name_char(ch as u8) as i32 {
+    if (ch >= 97 && ch <= 122) { return 1; }   // a-z
+    if (ch >= 65 && ch <= 90) { return 1; }    // A-Z
+    if (ch >= 48 && ch <= 57) { return 1; }    // 0-9
+    if (ch == 95) { return 1; }                // _
+    return 0;
+}
+
+// `$NAME` and `${NAME}` in `p`, replaced by their values.
+fn expand_env_refs(p as *u8, proj_env as *u8, t_env as *u8) as *u8 {
+    if (cast(i64, p) == 0) { return p; }
+    if (c.contains(p, "$") == 0) { return p; }
+    let is i64 as len = c.strlen(p);
+    let is *u8 as out with mut = c.str_dup("", 0);
+    let is i64 as seg with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        let is i64 as name_at with mut = 0;
+        let is i64 as name_end with mut = 0;
+        let is i64 as after with mut = 0;
+        if (p[i] == 36 && i + 1 < len) {
+            if (p[i + 1] == 123) {                         // ${NAME}
+                let is i64 as e with mut = i + 2;
+                while (e < len && _is_name_char(p[e]) == 1) { e = e + 1; }
+                if (e < len && p[e] == 125 && e > i + 2) {
+                    name_at = i + 2; name_end = e; after = e + 1;
+                }
+            } else if (_is_name_char(p[i + 1]) == 1) {     // $NAME
+                let is i64 as e with mut = i + 1;
+                while (e < len && _is_name_char(p[e]) == 1) { e = e + 1; }
+                name_at = i + 1; name_end = e; after = e;
+            }
+        }
+        if (after == 0) {
+            i = i + 1;
+        } else {
+            let is *u8 as nm = c.str_dup(cast(*u8, cast(i64, p) + name_at), cast(i32, name_end - name_at));
+            let is *u8 as v = env_value(nm, proj_env, t_env);
+            if (cast(i64, v) == 0) {
+                i = after;                                 // unset: keep it as written
+            } else {
+                out = c.str_cat(out, c.str_dup(cast(*u8, cast(i64, p) + seg), cast(i32, i - seg)));
+                out = c.str_cat(out, v);
+                i = after;
+                seg = i;
+            }
+        }
+    }
+    if (seg < len) {
+        out = c.str_cat(out, c.str_dup(cast(*u8, cast(i64, p) + seg), cast(i32, len - seg)));
+    }
+    return out;
+}
+
+// A deferred glob, matched now. Its matches replace it in place, so the link
+// order is still declaration order.
+fn _match_pending(t as *Target, inp as *Input, pat as *u8) as void {
+    let is i32 as n = c.glob_expand(pat);
+    if (n <= 0) {
+        c.eprint("error: target '");
+        io._write_fd(io.STDERR, t.name_ptr, cast(i64, t.name_len));
+        c.eprint("': ");
+        if (n < 0) { c.eprint("cannot list the directory of '"); }
+        else { c.eprint("no file matches '"); }
+        c.eprint(pat);
+        c.eprint("'");
+        if (c.contains(pat, "$") == 1) { c.eprint(" — a variable in it is not set"); }
+        c.write_nl(2);
+        io.exit(1);
+    }
+    let is *u8 as rest = inp.next;
+    inp.path_ptr = c.str_cat("", c.glob_get(0));
+    inp.path_len = cast(i32, c.strlen(inp.path_ptr));
+    inp.pending = 0;
+    let is *Input as tail with mut = inp;
+    let is i32 as k with mut = 1;
+    while (k < n) {
+        let is *Input as m = _new_input_path(inp.kind, c.str_cat("", c.glob_get(k)));
+        tail.next = cast(*u8, m);
+        tail = m;
+        k = k + 1;
+    }
+    tail.next = rest;
+    t.input_count = t.input_count + n - 1;
+}
+
+fn _expand_target_paths(proj as *Project) as void {
+    let is i32 as i with mut = 0;
+    while (i < proj.target_count) {
+        let is *Target as t = get_target(proj, i);
+        if (t.src_len > 0) {
+            t.src_ptr = expand_env_refs(t.src_ptr, proj.env, t.env);
+            t.src_len = cast(i32, c.strlen(t.src_ptr));
+        }
+        if (t.out_len > 0) {
+            t.out_ptr = expand_env_refs(t.out_ptr, proj.env, t.env);
+            t.out_len = cast(i32, c.strlen(t.out_ptr));
+        }
+        let is *Input as inp with mut = cast(*Input, t.inputs);
+        while (cast(i64, inp) != 0) {
+            let is *Input as next = cast(*Input, inp.next);
+            let is *u8 as p = expand_env_refs(inp.path_ptr, proj.env, t.env);
+            if (inp.pending == 1) {
+                _match_pending(t, inp, p);
+            } else {
+                inp.path_ptr = p;
+                inp.path_len = cast(i32, c.strlen(p));
+            }
+            inp = next;
+        }
+        i = i + 1;
+    }
 }
 
 fn _parse_body(proj as *Project) as void {

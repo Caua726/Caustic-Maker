@@ -43,6 +43,20 @@ Found while building and publishing the 0.2.0 artifacts.
     `.cse` names the toolchain ships under. It also no longer needs a
     `Causticfile` to run, which is where you are when setting your shell up.
 
+21. **A path through an environment variable was never expanded.** With
+    `env_default "CAUSTIC_DIR" "../Caustic"` and `src "${CAUSTIC_DIR}/src/main.cst"`
+    the build failed at once with `src not found: ${CAUSTIC_DIR}/src/main.cst`:
+    the shell would have expanded it in the compile command, but the maker reads
+    the path itself first — to check it exists, to stat it for the up-to-date
+    decision, to match a glob — and read it literally. `src`, `out` and every
+    link input (globs included) are now expanded once the whole file is parsed,
+    the way the shell prologue leaves the variable: inherited, then the
+    project's declarations, then the target's, `env_default` only over an empty
+    value. A name nothing defines stays as written, so the error names it. The
+    Windows expander had the precedence wrong as well — any declaration beat the
+    inherited value, so an `env_default` overrode what the user had set — and
+    now shares the same lookup.
+
 ### Added
 
 - **`profile "bundle"`** in the maker's own manifest: with the multi-architecture

@@ -22,6 +22,7 @@ use "../parser/parser.cst" as parser;
 // dependency graph is walked takes a buffer, so it is testable here without a
 // clone, a directory or a process.
 use "../exec/deps.cst" as deps;
+use "../../std/env.cst" as envm;
 
 let is i32 as _pass with mut = 0;
 let is i32 as _fail with mut = 0;
@@ -377,6 +378,48 @@ fn t_interpolate() as void {
     _check_str("mixed",                  _interp("$DIR/$HOME"), "build/$HOME");
 }
 
+// === environment variables in a target's paths ===
+// `src "${CAUSTIC_DIR}/src/main.cst"` has to name the file the shell would:
+// the maker stats it, checks it exists and matches globs through it before any
+// shell runs. A literal `${CAUSTIC_DIR}` there made the target unbuildable.
+
+fn _target0(m as *u8) as *parser.Target {
+    let is parser.Project as p = parser.parse(m, c.strlen(m));
+    let is *parser.Project as pp = cast(*parser.Project, c.galloc(sizeof(parser.Project)));
+    *pp = p;
+    return parser.get_target(pp, 0);
+}
+
+fn t_env_paths() as void {
+    _p("\n--- env in target paths ---\n");
+    let is *parser.Target as t with mut = _target0("env_default \"CMK_T_ROOT\" \"tests/fixtures/glob\"\ntarget \"t\" {\n    src \"${CMK_T_ROOT}/a.s\"\n    out \"$CMK_T_OUT/t\"\n    asm \"$CMK_T_ROOT/*.s\"\n    env \"CMK_T_OUT\" \"dist\"\n}\n");
+    _check_str("braced env_default",      c.str_dup(t.src_ptr, t.src_len), "tests/fixtures/glob/a.s");
+    // Declared AFTER the path that uses it: expansion waits for the whole file.
+    _check_str("target env, declared later", c.str_dup(t.out_ptr, t.out_len), "dist/t");
+    _check_int("glob through a variable", cast(i64, t.input_count), 2);
+    let is *parser.Input as i0 = cast(*parser.Input, t.inputs);
+    if (cast(i64, i0) != 0) {
+        _check_str("first glob match",    c.str_dup(i0.path_ptr, i0.path_len), "tests/fixtures/glob/a.s");
+        let is *parser.Input as i1 = cast(*parser.Input, i0.next);
+        if (cast(i64, i1) != 0) {
+            _check_str("second glob match", c.str_dup(i1.path_ptr, i1.path_len), "tests/fixtures/glob/b.s");
+        }
+    }
+
+    // env_default yields to what the environment already says; env does not.
+    let is *u8 as home = envm.getenv("HOME");
+    if (cast(i64, home) != 0) {
+        t = _target0("env_default \"HOME\" \"/nope\"\ntarget \"t\" {\n    src \"$HOME/x\"\n}\n");
+        _check_str("env_default keeps the inherited value",
+                   c.str_dup(t.src_ptr, t.src_len), c.str_cat(home, "/x"));
+        t = _target0("env \"HOME\" \"/forced\"\ntarget \"t\" {\n    src \"$HOME/x\"\n}\n");
+        _check_str("env overrides it",    c.str_dup(t.src_ptr, t.src_len), "/forced/x");
+    }
+    // Nothing defines it: left as written, so the error names the variable.
+    t = _target0("target \"t\" {\n    src \"${CMK_T_NEVER_SET}/x\"\n}\n");
+    _check_str("unset stays literal",     c.str_dup(t.src_ptr, t.src_len), "${CMK_T_NEVER_SET}/x");
+}
+
 // === scan_manifest_buf ===
 // What the resolver reads out of a CLONE's Causticfile in order to keep
 // walking: its `system` libs, and its own `depend` clauses.
@@ -430,7 +473,9 @@ fn t_scan_manifest() as void {
     _check_str("second of them",         c.str_dup(after.name_ptr, after.name_len), "b");
 }
 
-fn main() as i32 {
+fn main(argc as i64, argv as i64) as i32 {
+    // The env-in-paths cases read the inherited environment, as caustic-mk does.
+    envm.init(argc, cast(*u8, argv));
     _p("=== caustic-mk unit suite (tests/run_tests.cst) ===\n");
     io.mkdir("tests/tmp");
 
@@ -443,6 +488,7 @@ fn main() as i32 {
     t_write_if_changed();
     t_glob_expand();
     t_interpolate();
+    t_env_paths();
     t_scan_manifest();
 
     _p("\n=== ");

@@ -1,0 +1,10 @@
+name "env-src"
+
+// The source lives where a variable says, the way a project builds a sibling
+// checkout: `env_default "CAUSTIC_DIR" "../Caustic"` + `src "${CAUSTIC_DIR}/..."`.
+env_default "APP_SRC" "elsewhere"
+
+target "app" {
+    src "${APP_SRC}/main.cst"
+    out "build/app"
+}

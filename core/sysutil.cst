@@ -95,23 +95,14 @@ fn _is_var_char(ch as u8) as i32 {
     return 0;
 }
 
-// Value of $NAME: a declared `env` entry (narrower scope wins), else the
-// inherited environment, else empty — the same precedence sh applies.
+// Value of $NAME when the command runs — what the prologue above leaves it as:
+// inherited, then env1's declarations, then env2's, an `env_default` applying
+// only over an empty value. Shared with the parser, which expands the same
+// names in a target's paths. (This used to let any declaration win, so on
+// Windows an `env_default` overrode the value the user had set.)
 fn _var_value(name as *u8, env1 as *parser.EnvVar, env2 as *parser.EnvVar) as *u8 {
-    let is i32 as pass with mut = 0;
-    while (pass < 2) {
-        let is *parser.EnvVar as e with mut = env2;
-        if (pass == 1) { e = env1; }
-        while (cast(i64, e) != 0) {
-            if (c.streq(e.key_ptr, e.key_len, name) == 1) {
-                return c.str_dup(e.val_ptr, e.val_len);
-            }
-            e = cast(*parser.EnvVar, e.next);
-        }
-        pass = pass + 1;
-    }
-    let is *u8 as inherited = env.getenv(name);
-    if (cast(i64, inherited) != 0) { return inherited; }
+    let is *u8 as v = parser.env_value(name, cast(*u8, env1), cast(*u8, env2));
+    if (cast(i64, v) != 0) { return v; }
     return c.str_dup("", 0);
 }
 

@@ -671,6 +671,28 @@ elif use_fixture dep-cycle; then
     expect_file "build/app" "and the target builds"
 fi
 
+# ─── a source named through an environment variable ───────────────────────
+# `src "${APP_SRC}/main.cst"` with an `env_default` for it. The maker checks the
+# source exists and stats it for the up-to-date decision BEFORE any shell
+# expands anything, so the literal `${APP_SRC}` used to fail as "src not found"
+# and the target could not be built at all.
+step "a src path through an environment variable"
+if use_fixture env-src; then
+    # Inputs in the past, so an output written this second is newer than them.
+    touch -d '2001-01-01 00:00:00' Causticfile elsewhere/main.cst
+    mk build app
+    expect_rc 0 "the env_default value names the source"
+    expect_file "build/app" "and the target builds"
+    mk build app
+    expect_out "up to date" "a second build stats the real file"
+    touch elsewhere/main.cst
+    mk why app
+    expect_rc 1 "editing it makes the output stale"
+    OUT="$(APP_SRC=nowhere $MK build app 2>&1)"; RC=$?
+    expect_rc 1 "the inherited value wins over the env_default"
+    expect_out "src not found: nowhere/main.cst" "and the error names the expanded path"
+fi
+
 cd "$HERE" || exit 1
 printf "\n%s\n" "${B}=== integration: pass=$PASS fail=$FAIL ===${N}"
 [ "$FAIL" = 0 ] || exit 1
