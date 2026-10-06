@@ -106,10 +106,11 @@ case "$OUT" in *CROSS_OK*) ok "a script command runs via cmd.exe" ;;
                 *) bad "the script did not run"; note "$(printf '%s' "$OUT" | head -5)" ;; esac
 
 # ─── the glob diagnostic ───────────────────────────────────────────────────
-# std/io.list_dir has no Windows backend, so a glob CANNOT work there. What it
-# must not do is claim the pattern matched nothing — that sends you looking at
-# your own directory instead of at the missing capability.
-step "glob reports a capability gap, not a wrong answer"
+# std/io.list_dir has a Windows backend now, so a glob should RESOLVE here; the
+# skip branch below covers that. If it still fails, what it must not do is claim
+# the pattern matched nothing — that sends you looking at your own directory
+# instead of at the real reason.
+step "a glob resolves, or reports a real directory error"
 cat > "$PROJ/Causticfile" <<'EOF'
 name "crosstest"
 

@@ -732,15 +732,14 @@ fn _add_inputs(t as *Target, kind as i32, tok as *lx.Token) as void {
     }
     let is i32 as n = c.glob_expand(pat);
     // -1 and 0 are different failures and used to read as the same one. -1 means
-    // the directory could not be listed at all: it does not exist, or the host
-    // has no directory listing (std/io.list_dir has no Windows backend). Saying
-    // "no file matches" there sends the reader to check their own file names.
+    // the directory could not be listed at all — it does not exist, or it is not
+    // a directory. Saying "no file matches" there sends the reader to check
+    // their own file names.
     if (n < 0) {
         lx.err_head(tok.start);
         c.eprint("cannot list the directory of '");
         io._write_fd(io.STDERR, tok.ptr, cast(i64, tok.len));
-        c.eprint("' — no such directory, or this host cannot list directories");
-        c.eprint(" (globs need a Linux host: std/io.list_dir has no Windows backend)");
+        c.eprint("' — no such directory");
         lx.err_tail();
     }
     if (n == 0) {

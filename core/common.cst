@@ -490,11 +490,10 @@ fn glob_get(idx as i32) as *u8 {
 // Expand `pattern` into the module table.
 //
 // Returns the number of matches, 0 when the pattern matched nothing, and **-1
-// when the directory could not be listed at all** — a missing directory, or any
-// Windows host, where std/io.list_dir has no backend and returns -1. Collapsing
-// that into 0 made every Windows glob fail with "pattern matched nothing",
-// which sends you looking at your own file names instead of at the missing
-// capability.
+// when the directory could not be listed at all** — a missing path, or one that
+// is not a directory. Collapsing that into 0 made every such glob fail with
+// "pattern matched nothing", which sends you looking at your own file names
+// instead of at the directory.
 //
 // A pattern with no wildcard yields itself (existence is the caller's business,
 // so a plain path behaves exactly as before). Matches come out sorted so the

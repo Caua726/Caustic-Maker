@@ -184,8 +184,7 @@ fn exec_doctor(proj as *parser.Project) as i32 {
     if (os.current() == os.OS_LINUX) { _ok("os", "linux"); }
     else if (os.current() == os.OS_WINDOWS) {
         _ok("os", "windows");
-        // Both are real, documented gaps, and both are silent until they bite.
-        _note("globs", "`source`/`asm`/`obj` wildcards need a Linux host (std/io.list_dir has no Windows backend)");
+        // Globs work now that std/io.list_dir has a Windows backend.
         _note("manifest discovery", "no chdir binding on Windows — run caustic-mk from the project root");
     } else { _note("os", "unrecognised"); }
 

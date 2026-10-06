@@ -333,9 +333,9 @@ fn t_glob_expand() as void {
     _check_int("no match in real dir",    cast(i64, c.glob_expand("tests/fixtures/glob/*.nope")), 0);
 
     // A directory that cannot be listed is NOT the same as a pattern that
-    // matched nothing: io.list_dir returns -1 there (and on every Windows host,
-    // which has no backend for it). Reporting both as 0 made every Windows glob
-    // fail with "pattern matched nothing", pointing at the wrong thing.
+    // matched nothing: io.list_dir returns -1 there. Reporting both as 0 made
+    // such a glob fail with "pattern matched nothing", pointing at the wrong
+    // thing.
     _check_int("unlistable dir -> -1",
                cast(i64, c.glob_expand("tests/fixtures/no_such_dir/*.s")), 0 - 1);
 }
