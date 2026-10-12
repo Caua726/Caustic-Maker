@@ -700,6 +700,12 @@ fn _assemble(t as *parser.Target, proj as *parser.Project, as_bin as *u8, path a
     return rc;
 }
 
+// A compile whose .s the next step assembles has to ask for it: the compiler
+// writes no assembly beside a source unless `--emit-asm` asks. Every staged
+// path below goes through here — the target's main source, its extra `source`
+// inputs, and the incremental per-module compile.
+fn _ask_for_asm(cmd as *u8) as *u8 { return c.str_cat(cmd, " --emit-asm"); }
+
 fn run_pipeline_staged(t as *parser.Target, proj as *parser.Project) as i32 {
     let is *u8 as src = sys.abs_path(c.str_dup(t.src_ptr, t.src_len));
     _write_version_file(t, proj);
@@ -716,6 +722,7 @@ fn run_pipeline_staged(t as *parser.Target, proj as *parser.Project) as i32 {
         let is *u8 as cc with mut = c.str_cat3(caustic_bin, " -c ", src);
         cc = c.str_cat3(cc, " --cache ", sys.cache_dir());
         cc = c.str_cat(cc, _compile_cmd_tail(t, proj));
+        cc = _ask_for_asm(cc);
         if (_run_step(t, proj, cc) != 0) {
             c.eprint("error: compile failed: ");
             c.eprint(src);
@@ -861,6 +868,7 @@ fn _extra_objects(t as *parser.Target, proj as *parser.Project, caustic_bin as *
             let is *u8 as cc with mut = c.str_cat3(caustic_bin, " --module-only ", path);
             cc = c.str_cat(cc, " --cache .caustic");
             cc = c.str_cat(cc, _compile_cmd_tail(t, proj));
+            cc = _ask_for_asm(cc);
             ccmds[nc] = cast(i64, cc);
             nc = nc + 1;
             let is *u8 as mod_s = c.str_cat(path, ".s");
@@ -1210,6 +1218,7 @@ fn run_pipeline_incremental(t as *parser.Target, proj as *parser.Project) as i32
                 if (STAGE3_CSTI == 1) { cc = c.str_cat3(cc, " --emit-csti --csti-dir ", csti_dir); }
                 cc = c.str_cat(cc, tail);
                 cc = c.str_cat3(cc, " -q", sys.quiet_suffix());
+                cc = _ask_for_asm(cc);
                 if (_run_step(t, proj, cc) != 0) {
                     c.eprint("incremental: compile failed: "); c.eprint(modpath); c.write_nl(2);
                     return 1;
